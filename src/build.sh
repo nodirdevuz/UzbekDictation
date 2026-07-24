@@ -10,14 +10,17 @@ LIB_ARM="$WC/build-static"   # arm64 — Metal GPU
 LIB_X64="$WC/build-x64"      # x86_64 — faqat CPU (Intel)
 APP="$HOME/Applications/RubaiSTT Dictation.app"
 
-if [ ! -f "$LIB_ARM/src/libwhisper.a" ]; then
-    echo "Xato: whisper.cpp statik kutubxonalari topilmadi. Avval setup.sh ni ishga tushiring." >&2
+# Qaysi arxitekturalar build qilinadi — mavjud kutubxonalarga qarab.
+ARCHS=()
+[ -f "$LIB_ARM/src/libwhisper.a" ] && ARCHS+=("arm64")
+[ -f "$LIB_X64/src/libwhisper.a" ] && ARCHS+=("x86_64")
+if [ ${#ARCHS[@]} -eq 0 ]; then
+    echo "Xato: whisper.cpp statik kutubxonalari topilmadi ($LIB_ARM yoki $LIB_X64). Avval setup.sh ni ishga tushiring." >&2
     exit 1
 fi
 
-# Qaysi arxitekturalar build qilinadi: doim arm64; build-x64 mavjud bo'lsa — universal.
-ARCHS=("arm64")
-[ -f "$LIB_X64/src/libwhisper.a" ] && ARCHS+=("x86_64")
+# Kompyuterni qizdirmaslik uchun past prioritet bilan
+NICE="nice -n 10"
 
 COMMON_FW="-framework Foundation -framework Accelerate -framework AVFoundation \
     -framework AppKit -framework QuartzCore -framework CoreGraphics \
@@ -32,12 +35,15 @@ for ARCH in "${ARCHS[@]}"; do
         METAL="-Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-metal/libggml-metal.a \
             -framework Metal -framework MetalKit"
     else
-        LIB="$LIB_X64"; TRIPLE="x86_64-apple-macos13.0"; METAL=""
+        # x86_64 — faqat CPU. Metal bu Mac'da (AMD Radeon Pro) CPU'dan ~24 barobar
+        # sekin chiqdi, shuning uchun ulanmaydi. BLAS (Accelerate) backend kerak.
+        LIB="$LIB_X64"; TRIPLE="x86_64-apple-macos13.0"
+        METAL="-Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-blas/libggml-blas.a"
     fi
     echo "  -> $ARCH"
-    clang -c "$SRC/whisper_bridge.c" -arch "$ARCH" -O2 \
+    $NICE clang -c "$SRC/whisper_bridge.c" -arch "$ARCH" -O2 \
         -I"$WC/include" -I"$WC/ggml/include" -o "$SRC/whisper_bridge.$ARCH.o"
-    swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/whisper_bridge.$ARCH.o" \
+    $NICE swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/whisper_bridge.$ARCH.o" \
         -import-objc-header "$SRC/Bridging.h" \
         "$LIB/src/libwhisper.a" \
         "$LIB/ggml/src/libggml.a" \
@@ -85,9 +91,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "[4/4] Ad-hoc imzolash..."
+echo "[4/4] Imzolash..."
 xattr -cr "$APP" 2>/dev/null || true
-codesign --force --deep --sign - --entitlements "$SRC/entitlements.plist" "$APP" 2>/dev/null \
-    || codesign --force --deep --sign - "$APP"
+# Barqaror lokal sertifikat bo'lsa — o'sha bilan imzolaymiz. Ad-hoc imzoda har
+# qayta build'da cdhash o'zgaradi va macOS Accessibility ruxsatini bekor qiladi;
+# bitta sertifikat bilan esa ruxsat saqlanib qoladi.
+LOCAL_ID="RubaiSTT Local Signing"
+if security find-certificate -c "$LOCAL_ID" >/dev/null 2>&1; then
+    echo "  imzo: $LOCAL_ID"
+    codesign --force --deep --sign "$LOCAL_ID" --entitlements "$SRC/entitlements.plist" "$APP" 2>/dev/null \
+        || codesign --force --deep --sign "$LOCAL_ID" "$APP"
+else
+    echo "  imzo: ad-hoc"
+    codesign --force --deep --sign - --entitlements "$SRC/entitlements.plist" "$APP" 2>/dev/null \
+        || codesign --force --deep --sign - "$APP"
+fi
 
 echo "Tayyor: $APP"
