@@ -93,6 +93,12 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads) {
     p.print_special     = false;
     p.print_timestamps  = false;
     p.suppress_blank    = true;
+    // "Nutq bo'lmagan" tokenlarni dekoderning o'zida bostiramiz — jimlikda
+    // paydo bo'ladigan «[музыка]», «*звук птиц*» kabi izohlarning asosiy manbai.
+    p.suppress_nst      = true;
+    // DIQQAT: no_speech_thold ni pasaytirmaymiz. 0.45 da tekshirildi —
+    // oddiy, aniq nutq ham butunlay tashlab yuborilgan (matn bo'sh chiqdi).
+    // Standart 0.6 qoladi.
 
     // Harorat bo'yicha qayta urinish (fallback) o'chirilgan: "yomon" segmentda
     // whisper dekoderni 5 martagacha qayta yurgizadi — kutish bir necha barobar

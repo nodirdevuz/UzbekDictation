@@ -1365,16 +1365,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Butunlay qavs/yulduzcha ichidagi qisqa natija — bu nutq emas, whisper'ning
-    // "sahna izohi": «*qush sayrashi*», «(musiqa)», «[shovqin]». Bunday matnni
-    // foydalanuvchi maydoniga qo'ymaymiz.
+    // Whisper jimlikda "sahna izohi" o'ylab topadi: «[музыка]», «*звук птиц*»,
+    // «(аплодисменты)». Ular matn ICHIDA ham, oxirida ham chiqadi — masalan
+    // «...ясно понятно. [музыка]». Shuning uchun butun matnni emas, har bir
+    // bo'lakni alohida tozalaymiz.
+    //
+    // [...] va *...* — diktovkada odam bunday yozdirmaydi, doim olib tashlaymiz.
+    // (...) — faqat ichida "tovush" so'zlari bo'lsa yoki juda qisqa bo'lsa.
+    private static let soundWords = [
+        "музык", "звук", "шум", "смех", "аплодис", "тишин", "птиц", "аудио", "субтитр",
+        "music", "sound", "noise", "laugh", "applause", "silence", "blank_audio", "subtitle",
+        "musiqa", "tovush", "shovqin", "kulgi",
+    ]
+
     static func dropHallucination(_ t: String) -> String {
-        let s = t.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard s.count <= 40, let f = s.first, let l = s.last else { return s }
-        let wrapped = (f == "(" && l == ")") || (f == "*" && l == "*")
-                   || (f == "[" && l == "]") || (f == "«" && l == "»")
-        if wrapped { NSLog("[rubai] natija tashlandi (sahna izohi): '\(s)'"); return "" }
+        var s = t
+        for (open, close, always) in [("[", "]", true), ("*", "*", true), ("(", ")", false)] {
+            s = removeTags(in: s, open: open, close: close, always: always)
+        }
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ortda qolgan yakka tinish belgilari
+        while let f = s.first, ".,;:!?-—…".contains(f) {
+            s = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+        if s != t.trimmingCharacters(in: .whitespacesAndNewlines) {
+            NSLog("[rubai] sahna izohlari tozalandi: '\(t)' -> '\(s)'")
+        }
         return s
+    }
+
+    private static func removeTags(in text: String, open: String, close: String, always: Bool) -> String {
+        var out = text
+        var guardCount = 0
+        while guardCount < 20, let r1 = out.range(of: open) {
+            let rest = out[r1.upperBound...]
+            guard let r2 = rest.range(of: close) else { break }
+            let inner = String(rest[..<r2.lowerBound])
+            guardCount += 1
+            guard inner.count <= 40 else { break }
+            let low = inner.lowercased()
+            // Yumaloq qavs uchun ehtiyot bo'lamiz: «(a + b)» kabi haqiqiy matnni
+            // saqlaymiz, «(музыка)», «(права)» kabi bitta so'zlik izohni olib tashlaymiz.
+            let singleWord = !inner.contains(" ") && inner.count <= 15
+            let isSound = always || singleWord || soundWords.contains { low.contains($0) }
+            guard isSound else { break }
+            out.replaceSubrange(r1.lowerBound..<r2.upperBound, with: "")
+            out = out.replacingOccurrences(of: "  ", with: " ")
+        }
+        return out
     }
 
     private func cancel() {
