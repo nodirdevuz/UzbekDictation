@@ -1271,6 +1271,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loginItem: NSMenuItem!
     private var langItemRU: NSMenuItem!
     private var langItemUZ: NSMenuItem!
+    private var accurateItem: NSMenuItem!
+
+    // «Aniqroq rejim» — beam search. Sozlama saqlanadi.
+    private var accurate: Bool {
+        get { UserDefaults.standard.bool(forKey: "accurateMode") }
+        set { UserDefaults.standard.set(newValue, forKey: "accurateMode") }
+    }
 
     // Joriy diktovka tili va u qaysi tap-seriyasida boshlanganini eslab qolamiz
     private var lang = "ru"
@@ -1306,6 +1313,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(langItemRU)
         menu.addItem(langItemUZ)
         menu.addItem(.separator())
+        accurateItem = NSMenuItem(title: "Aniqroq rejim (sekinroq)", action: #selector(toggleAccuracy), keyEquivalent: "")
+        accurateItem.state = accurate ? .on : .off
+        menu.addItem(accurateItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Sozlamalar…", action: #selector(openSettings), keyEquivalent: ","))
         loginItem = NSMenuItem(title: "Login'da ishga tushirish", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.state = LoginItem.isEnabled ? .on : .off
@@ -1319,6 +1330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lang = defaultLang
         refreshLangMenu()
         Whisper.shared.setLanguage(lang)
+        rubai_set_accuracy(accurate ? 1 : 0)
 
         // Zaxira birikma (⌃⌥D) — ishlashda qoladi
         hotkey.install()
@@ -1557,6 +1569,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func pickRU() { switchLanguage("ru") }
     @objc private func pickUZ() { switchLanguage("uz") }
+
+    @objc private func toggleAccuracy() {
+        accurate.toggle()
+        accurateItem.state = accurate ? .on : .off
+        rubai_set_accuracy(accurate ? 1 : 0)
+        NSLog("[rubai] aniqroq rejim: \(accurate)")
+        overlay.flash(accurate ? "Aniqroq rejim" : "Tez rejim", seconds: 1.2)
+    }
 
     @objc private func toggleLogin() {
         LoginItem.set(!LoginItem.isEnabled)

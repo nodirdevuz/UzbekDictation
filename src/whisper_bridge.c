@@ -12,6 +12,11 @@ static char g_model_dir[900] = {0};
 // Oldin ~/.rubaistt_lang fayli o'qilardi (Hammerspoon uchun); endi kerak emas.
 static char g_lang[8] = "ru";
 
+// 0 = tez (greedy), 1 = aniq (beam search). Menyudan almashtiriladi.
+static int g_accurate = 0;
+
+void rubai_set_accuracy(int accurate) { g_accurate = accurate ? 1 : 0; }
+
 void rubai_set_language(const char *lang) {
     if (!lang) return;
     if (strcmp(lang, "ru") == 0) strcpy(g_lang, "ru");
@@ -79,11 +84,13 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads) {
     }
     if (!ctx) return NULL;
 
-    // GREEDY — beam search (3) o'rniga. O'lchov (11 s nutq, medium model):
-    // beam3 = 10.5 s, greedy = 4.6 s. Aniqlik deyarli o'zgarmaydi.
-    struct whisper_full_params p =
-        whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    p.greedy.best_of    = 1;
+    // Tez rejim — GREEDY (11 s nutqda medium model: 4.6 s).
+    // Aniq rejim — beam search 3 (o'sha nutqda 10.5 s, lekin so'zlar aniqroq).
+    struct whisper_full_params p = g_accurate
+        ? whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH)
+        : whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    if (g_accurate) p.beam_search.beam_size = 3;
+    else            p.greedy.best_of = 1;
     p.language          = lang;
     p.translate         = false;
     p.n_threads         = n_threads > 0 ? n_threads : 4;
@@ -93,6 +100,17 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads) {
     p.print_special     = false;
     p.print_timestamps  = false;
     p.suppress_blank    = true;
+
+    // Kontekst maslahati: modelga qaysi atamalar uchrashini oldindan aytamiz.
+    // Whisper ularni "eshitishga tayyor" bo'ladi va «Supabase»ni «Суп абаз» deb
+    // yozmaydi. Tezlikka ta'siri yo'q — bu shunchaki dekoder uchun old matn.
+    p.initial_prompt = (strcmp(lang, "ru") == 0)
+        ? "Разговор про разработку: Supabase, Railway, Vercel, Odoo, Telegram, "
+          "бот, API, Docker, GitHub, Nvidia, Claude, деплой, база данных, "
+          "курьер, заказ, склад, касса, сум."
+        : "Dasturlash haqida suhbat: Supabase, Railway, Vercel, Odoo, Telegram, "
+          "bot, API, Docker, GitHub, Nvidia, Claude, ma'lumotlar bazasi, "
+          "kuryer, buyurtma, ombor, kassa, so'm.";
     // "Nutq bo'lmagan" tokenlarni dekoderning o'zida bostiramiz — jimlikda
     // paydo bo'ladigan «[музыка]», «*звук птиц*» kabi izohlarning asosiy manbai.
     p.suppress_nst      = true;
