@@ -107,7 +107,7 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads) {
     // Haqiqiy uzunlikka moslaymiz (+1.5 s zaxira; ilgari +3 s edi).
     {
         double dur_sec = (double)n_samples / 16000.0;
-        int actx = (int)((dur_sec + 0.8) * 50.0);
+        int actx = (int)((dur_sec + 0.5) * 50.0);
         if (actx < 256) actx = 256;
         if (actx > 1500) actx = 1500;
         p.audio_ctx = actx;

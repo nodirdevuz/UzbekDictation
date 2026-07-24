@@ -104,6 +104,10 @@ final class Recorder {
         lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
         // Har yozishda YANGI engine — login'da/qurilma o'zgarganda qotib qolgan
         // (jim, "musiqa") holatdan saqlaydi.
+        //
+        // DIQQAT: engine'ni oldindan tayyorlab qo'yish (prepare()) mumkin emas —
+        // AVAudioEngineGraph::Initialize ObjC-istisno tashlaydi, Swift uni ushlay
+        // olmaydi va ilova qulaydi (SIGSEGV, 25.07.2026 da tekshirildi).
         engine = AVAudioEngine()
         let input = engine.inputNode
         let hw = input.outputFormat(forBus: 0)
@@ -131,9 +135,12 @@ final class Recorder {
                     var sum: Float = 0
                     for i in 0..<n { let v = ch[0][i]; sum += v * v }
                     let rms = sqrt(sum / Float(n))
-                    // -50 dB … -6 dB oralig'ini 0…1 ga chiziqli o'girish
+                    // Nutq oralig'i: -52 dB (jimlik) … -14 dB (baland gap).
+                    // Kvadrat ildiz — pastki qismini "ochadi": shivirlash ham ko'rinadi,
+                    // baland ovoz esa ustunni to'liq ko'taradi.
                     let db = 20 * log10(max(rms, 1e-6))
-                    let lvl = max(0, min(1, (db + 50) / 44))
+                    let norm = max(0, min(1, (db + 52) / 38))
+                    let lvl = sqrt(norm)
                     DispatchQueue.main.async { self.onLevel?(lvl) }
                 }
             }
@@ -192,8 +199,8 @@ final class Recorder {
         let peak = rms.max() ?? 0
         guard peak > 0.004 else { return s }
         let thr = max(0.006, peak * 0.08)
-        let maxPauseWins = Int(0.7 * 16000) / win
-        let keepWins     = Int(0.25 * 16000) / win
+        let maxPauseWins = Int(0.5 * 16000) / win
+        let keepWins     = Int(0.2 * 16000) / win
 
         var out = [Float](); out.reserveCapacity(s.count)
         var i = 0
@@ -218,6 +225,12 @@ final class Recorder {
         return out
     }
 
+    // Yozuvdagi eng baland joy — "umuman jim edi" holatini aniqlash uchun
+    static func peakLevel(_ s: [Float]) -> Float {
+        guard !s.isEmpty else { return 0 }
+        return envelope(s).max() ?? 0
+    }
+
     // whisper 1 soniyadan qisqa audioni qabul qilmaydi — nol bilan to'ldiramiz.
     static func padIfShort(_ s: [Float]) -> [Float] {
         let minLen = Int(1.1 * 16000)
@@ -236,9 +249,9 @@ private final class CapsuleView: NSView {
     var messageText: String = ""
     // levels — ekrandagi (silliq), targets — mikrofondan kelgan nishon qiymatlar.
     // Bittasi ortiqcha: to'lqin uzluksiz surilishi uchun (phase bilan).
-    static let barCount = 16
-    var levels: [CGFloat] = Array(repeating: 0.03, count: barCount + 1)
-    var targets: [CGFloat] = Array(repeating: 0.03, count: barCount + 1)
+    static let barCount = 11
+    var levels: [CGFloat] = Array(repeating: 0.02, count: barCount + 1)
+    var targets: [CGFloat] = Array(repeating: 0.02, count: barCount + 1)
     var phase: CGFloat = 0                // 0…1 — qadamlar orasidagi uzluksiz siljish
     var spinPhase: CGFloat = 0
     var dotsPhase: CGFloat = 0
@@ -303,12 +316,12 @@ private final class CapsuleView: NSView {
             .kern: 0.5,
         ]
         let str = NSAttributedString(string: badge, attributes: attrs)
-        let badgeX = leftBtnCenter.x + btnR + 6
+        let badgeX = leftBtnCenter.x + btnR + 5
         str.draw(at: NSPoint(x: badgeX, y: r.midY - str.size().height / 2 + 0.5))
 
         // Ekvalayzer
-        let barsX0 = badgeX + str.size().width + 7
-        let barsX1 = rightBtnCenter.x - btnR - 7
+        let barsX0 = badgeX + str.size().width + 5
+        let barsX1 = rightBtnCenter.x - btnR - 5
         drawBars(from: barsX0, to: barsX1, midY: r.midY)
 
         drawAcceptButton()
@@ -319,7 +332,7 @@ private final class CapsuleView: NSView {
     private func drawBars(from x0: CGFloat, to x1: CGFloat, midY: CGFloat) {
         let visible = CapsuleView.barCount
         guard levels.count > visible, x1 > x0 else { return }
-        let barW: CGFloat = 1.8
+        let barW: CGFloat = 2.6
         let step = (x1 - x0) / CGFloat(visible - 1)
         let base = lang == "ru"
             ? NSColor.white
@@ -333,8 +346,9 @@ private final class CapsuleView: NSView {
             if x < x0 + step      { edge = max(0, (x - (x0 - step)) / (step * 2)) }
             else if x > x1 - step { edge = max(0, ((x1 + step) - x) / (step * 2)) }
 
-            let h = 2.2 + levels[min(i, levels.count - 1)] * 12
-            base.withAlphaComponent(0.88 * edge).setFill()
+            // jim — ingichka chiziqcha, gapirganda — baland ustun (diktofondagidek)
+            let h = 2.6 + levels[min(i, levels.count - 1)] * 18
+            base.withAlphaComponent(0.9 * edge).setFill()
             let rect = NSRect(x: x - barW / 2, y: midY - h / 2, width: barW, height: h)
             NSBezierPath(roundedRect: rect, xRadius: barW / 2, yRadius: barW / 2).fill()
         }
@@ -420,7 +434,7 @@ final class Overlay {
     private var timer: Timer?
     private var frame = 0
     private var currentLevel: CGFloat = 0
-    private let W: CGFloat = 172
+    private let W: CGFloat = 126
     private let H: CGFloat = 32
 
     var onCancel: (() -> Void)?
@@ -506,9 +520,14 @@ final class Overlay {
     }
 
     // Mikrofondan kelgan daraja — faqat yig'iladi, chizishni taymer boshqaradi.
+    // Assimetrik filtr (haqiqiy VU-o'lchagichlardagidek): ovoz kelganda tez
+    // ko'tariladi, jimlikda esa asta tushadi — shuning uchun "qayerda gapirdim,
+    // qayerda jim turdim" aniq ko'rinadi.
     func push(level: Float) {
-        // yumshoq filtr: ovoz sakrashlari to'lqinni "titratmasin"
-        currentLevel = currentLevel * 0.55 + CGFloat(level) * 0.45
+        let v = CGFloat(level)
+        currentLevel = v > currentLevel
+            ? currentLevel * 0.35 + v * 0.65      // hujum — tez
+            : currentLevel * 0.82 + v * 0.18      // so'nish — yumshoq
     }
 
     private func appear(_ p: NSPanel) {
@@ -551,10 +570,13 @@ final class Overlay {
                 v.targets.removeFirst()
                 v.targets.append(currentLevel)
             }
+            var changed = false
             for i in v.levels.indices {
-                v.levels[i] += (v.targets[i] - v.levels[i]) * 0.18
+                let d = v.targets[i] - v.levels[i]
+                if abs(d) > 0.0015 { v.levels[i] += d * 0.3; changed = true }
             }
-            v.needsDisplay = true
+            // jimlikda hech narsa o'zgarmasa — qayta chizmaymiz (protsessor bo'sh turadi)
+            if changed { v.needsDisplay = true }
         case .processing:
             v.spinPhase += dt * 3.4
             v.dotsPhase += dt * 5.2
@@ -1319,17 +1341,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startedByTapSeries = false
         taps.resetSeries()
         let raw = rec.stop()
+
+        // Jim yozuvda whisper "*qush sayrashi*", "(musiqa)" kabi narsalarni
+        // o'ylab topadi va ular matn maydoniga tushib qoladi. Shuning uchun
+        // umuman ovoz bo'lmasa — umuman tanimaymiz.
+        let peak = Recorder.peakLevel(raw)
+        if peak < 0.012 {
+            NSLog("[rubai] jim yozuv (peak=\(String(format: "%.4f", peak))) — tanilmadi")
+            overlay.flash("Ovoz eshitilmadi", seconds: 1.4)
+            return
+        }
+
         let trimmed = Recorder.padIfShort(Recorder.compressPauses(Recorder.trimSilence(raw)))
         NSLog("[rubai] stopped: \(String(format: "%.1f", Double(raw.count)/16000.0))s -> \(String(format: "%.1f", Double(trimmed.count)/16000.0))s (jimlik kesildi)")
         overlay.showProcessing()
         Whisper.shared.transcribe(trimmed) { [weak self] text in
             NSLog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
             self?.overlay.hide()
-            Inserter.insert(text)
+            Inserter.insert(AppDelegate.dropHallucination(text))
         } fail: { [weak self] msg in
             NSLog("[rubai] transcription XATO: \(msg)")
             self?.overlay.flash("⚠️ \(msg)")
         }
+    }
+
+    // Butunlay qavs/yulduzcha ichidagi qisqa natija — bu nutq emas, whisper'ning
+    // "sahna izohi": «*qush sayrashi*», «(musiqa)», «[shovqin]». Bunday matnni
+    // foydalanuvchi maydoniga qo'ymaymiz.
+    static func dropHallucination(_ t: String) -> String {
+        let s = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.count <= 40, let f = s.first, let l = s.last else { return s }
+        let wrapped = (f == "(" && l == ")") || (f == "*" && l == "*")
+                   || (f == "[" && l == "]") || (f == "«" && l == "»")
+        if wrapped { NSLog("[rubai] natija tashlandi (sahna izohi): '\(s)'"); return "" }
+        return s
     }
 
     private func cancel() {
