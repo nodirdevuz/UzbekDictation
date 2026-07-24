@@ -100,11 +100,15 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads) {
     // oddiy, aniq nutq ham butunlay tashlab yuborilgan (matn bo'sh chiqdi).
     // Standart 0.6 qoladi.
 
-    // Harorat bo'yicha qayta urinish (fallback) o'chirilgan: "yomon" segmentda
-    // whisper dekoderni 5 martagacha qayta yurgizadi — kutish bir necha barobar
-    // oshadi. Diktovka uchun bitta o'tish yetarli.
+    // Harorat bo'yicha qayta urinish (fallback) YOQILGAN.
+    // Uni o'chirganda o'zbekcha qisqa yozuvlarda dekoder "sirg'alib ketardi":
+    // bitta jumla 9 marta takrorlanib chiqdi (25.07.2026, 3.3 s yozuv).
+    // Aynan fallback shunday tsiklni uzadi — entropiya chegarasi ishga tushib,
+    // segment yuqoriroq haroratda qayta o'qiladi.
+    // Narxi o'lchandi: yaxshi yozuvda deyarli nol (4.5 s -> 4.6 s), chunki
+    // fallback faqat muammoli segmentda ishlaydi.
     p.temperature       = 0.0f;
-    p.temperature_inc   = 0.0f;
+    p.temperature_inc   = 0.2f;
     // Oldingi segment matnini prompt sifatida bermaymiz — tezroq va barqarorroq.
     p.no_context        = true;
 

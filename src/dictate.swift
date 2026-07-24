@@ -21,10 +21,23 @@ final class Whisper {
         return Int32(max(4, ProcessInfo.processInfo.activeProcessorCount / 2))
     }()
 
+    // Model qayerdan izlanadi. Bundle ichida bo'lmasligi mumkin: build.sh
+    // ilovani ~/Applications ga yig'adi, modellar esa /Applications dagi
+    // nusxada turadi. Shuning uchun barcha ma'lum joylarni ketma-ket tekshiramiz —
+    // qaysi nusxa ishga tushsa ham diktovka ishlayveradi.
     private func modelPath() -> String? {
-        if let p = Bundle.main.path(forResource: "ggml-rubaistt", ofType: "bin") { return p }
-        let fb = NSHomeDirectory() + "/rubai-stt/models/ggml-rubaistt.bin"
-        return FileManager.default.fileExists(atPath: fb) ? fb : nil
+        var candidates: [String] = []
+        if let p = Bundle.main.path(forResource: "ggml-rubaistt", ofType: "bin") { candidates.append(p) }
+        candidates += [
+            "/Applications/RubaiSTT Dictation.app/Contents/Resources/ggml-rubaistt.bin",
+            NSHomeDirectory() + "/Applications/RubaiSTT Dictation.app/Contents/Resources/ggml-rubaistt.bin",
+            NSHomeDirectory() + "/rubai-stt/models/ggml-rubaistt.bin",
+        ]
+        for p in candidates where FileManager.default.fileExists(atPath: p) {
+            if p != candidates.first { NSLog("[rubai] model boshqa joydan olindi: \(p)") }
+            return p
+        }
+        return nil
     }
 
     // Ilova ishga tushganda fonda chaqiriladi — birinchi diktovkadagi
@@ -694,7 +707,56 @@ final class CommandTapDetector {
     // NSEvent global monitorlari esa alohida "Input Monitoring" ruxsatini talab
     // qiladi — u bo'lmasa jimgina hech narsa kelmaydi. Shuning uchun asosiy yo'l
     // — event tap, monitorlar faqat zaxira.
+    private var watchdog: Timer?
+
     func install() {
+        installTap()
+        startWatchdog()
+    }
+
+    // Uyqudan uyg'onish, ekran qulfi, foydalanuvchi seansi almashishi —
+    // bularning har biri event tap'ni o'chirib qo'yishi mumkin. Shuning uchun
+    // uni doimiy kuzatamiz va tiklaymiz: "ertaga ham, bir haftadan keyin ham
+    // xuddi shunday ishlasin".
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.checkAlive()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        watchdog = t
+
+        let nc = NSWorkspace.shared.notificationCenter
+        for name: NSNotification.Name in [NSWorkspace.didWakeNotification,
+                                          NSWorkspace.screensDidWakeNotification,
+                                          NSWorkspace.sessionDidBecomeActiveNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                NSLog("[rubai] tizim uyg'ondi — tap tekshirilmoqda")
+                self?.checkAlive()
+            }
+        }
+    }
+
+    private func checkAlive() {
+        guard let p = tapPort else { installTap(); return }
+        if !CGEvent.tapIsEnabled(tap: p) {
+            NSLog("[rubai] tap o'chib qolgan — yoqilmoqda")
+            CGEvent.tapEnable(tap: p, enable: true)
+            if !CGEvent.tapIsEnabled(tap: p) {
+                NSLog("[rubai] yoqilmadi — qaytadan yaratamiz")
+                teardownTap()
+                installTap()
+            }
+        }
+    }
+
+    private func teardownTap() {
+        if let s = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
+        if let p = tapPort { CFMachPortInvalidate(p) }
+        tapSource = nil; tapPort = nil
+    }
+
+    private func installTap() {
         let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
                               | (1 << CGEventType.keyDown.rawValue)
         let me = Unmanaged.passUnretained(self).toOpaque()
@@ -711,6 +773,7 @@ final class CommandTapDetector {
             NSLog("[rubai] CGEventTap o'rnatildi (AXTrusted=\(AXIsProcessTrusted()))")
         } else {
             NSLog("[rubai] CGEventTap yaratilmadi — NSEvent monitorlari (zaxira)")
+            guard globalMon == nil else { return }   // takroriy o'rnatishdan saqlanamiz
             let m: NSEvent.EventTypeMask = [.flagsChanged, .keyDown,
                                             .leftMouseDown, .rightMouseDown, .otherMouseDown]
             globalMon = NSEvent.addGlobalMonitorForEvents(matching: m) { [weak self] e in
@@ -1358,7 +1421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Whisper.shared.transcribe(trimmed) { [weak self] text in
             NSLog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
             self?.overlay.hide()
-            Inserter.insert(AppDelegate.dropHallucination(text))
+            Inserter.insert(AppDelegate.collapseRepeats(AppDelegate.dropHallucination(text)))
         } fail: { [weak self] msg in
             NSLog("[rubai] transcription XATO: \(msg)")
             self?.overlay.flash("⚠️ \(msg)")
@@ -1392,6 +1455,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("[rubai] sahna izohlari tozalandi: '\(t)' -> '\(s)'")
         }
         return s
+    }
+
+    // Dekoder "sirg'alib" ketganda bitta jumlani qayta-qayta chiqaradi
+    // (o'zbekchada 3.3 s yozuvda 9 marta takrorlangan holat kuzatilgan).
+    // Asosiy himoya — harorat fallback'i (whisper_bridge.c), bu esa ikkinchi
+    // qavat: ketma-ket takrorlangan bloklarni yig'ib tashlaymiz.
+    //
+    // k=1 (yakka so'z) uchun 3 martadan, k>=2 (jumla) uchun 2 martadan
+    // boshlab qisqartiramiz — jonli nutqdagi «ha, ha» yoki «juda juda» qoladi.
+    static func collapseRepeats(_ text: String) -> String {
+        var words = text.split(separator: " ").map(String.init)
+        guard words.count > 3 else { return text }
+
+        func norm(_ w: String) -> String {
+            w.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".,!?;:—-…\"'«»()"))
+        }
+
+        var changed = true
+        var loops = 0
+        while changed && loops < 40 {
+            changed = false; loops += 1
+            outer: for k in 1...max(1, min(14, words.count / 2)) {
+                var i = 0
+                while i + 2 * k <= words.count {
+                    let a = words[i..<i+k].map(norm)
+                    if a == words[i+k..<i+2*k].map(norm) {
+                        var reps = 2
+                        var j = i + 2 * k
+                        while j + k <= words.count, words[j..<j+k].map(norm) == a { reps += 1; j += k }
+                        if reps >= (k == 1 ? 3 : 2) {
+                            words.removeSubrange((i + k)..<(i + k * reps))
+                            changed = true
+                            break outer
+                        }
+                    }
+                    i += 1
+                }
+            }
+        }
+        let out = words.joined(separator: " ")
+        if out != text { NSLog("[rubai] takrorlar yig'ildi: \(text.count) -> \(out.count) belgi") }
+        return out
     }
 
     private static func removeTags(in text: String, open: String, close: String, always: Bool) -> String {
