@@ -1,56 +1,194 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Инструкция для Claude Code по этому репозиторию. Написана после большой переработки
+25.07.2026 — всё, что здесь названо «проверено», подтверждено замером на машине владельца,
+а не рассуждением. Прочитай целиком перед первой правкой: половина пунктов — это грабли,
+на которые уже наступали.
 
-## What this is
+## Что это
 
-A system-wide Uzbek speech-to-text dictation app for macOS (Apple Silicon only). Press **⌃⌥D** anywhere, speak Uzbek, and the transcription is typed into the focused field via clipboard + ⌘V. Fully offline — `islomov/rubaistt_v2_medium` (a Whisper fine-tune) runs locally through whisper.cpp with Metal. It's a menu-bar accessory app (`LSUIElement`), ad-hoc signed (no Apple Developer cert).
+Системная диктовка речь→текст для macOS. Работает **офлайн** через whisper.cpp.
+Меню-бар приложение без окна (`LSUIElement`).
 
-Note: comments, log strings, and user-facing text are in **Uzbek**. Match that when editing existing code.
+**Управление:**
 
-## Build & run
+| Действие | Что делает |
+|---|---|
+| **⌘⌘** (двойной тап) | старт записи, русский |
+| **⌘⌘⌘** (тройной) | старт записи, узбекский (третий тап переключает язык на лету, запись не прерывается) |
+| **⌘** (одиночный, во время записи) | стоп → распознавание → вставка текста |
+| **⎋** или ✕ в капсуле | отмена без вставки |
+| ⌃⌥D | запасной вариант (Carbon hotkey) |
 
-There is no test suite, linter, or package manager. Everything is shell scripts + a single Swift compile.
+Тап засчитывается только «чистый»: ⌘ нажали и отпустили быстро, без других клавиш и
+модификаторов. ⌘C, ⌘V, ⌘Tab и удержание ⌘ запись не запускают.
+
+**Две модели** (лежат в `Contents/Resources` установленной копии):
+`ggml-rubaistt.bin` — узбекский, `islomov/rubaistt_v2_medium` q8_0, 785 МБ;
+`ggml-multilingual.bin` — русский, Whisper small q8_0, 252 МБ. Обе грузятся в RAM при
+старте и **не выгружаются**.
+
+Комментарии, логи и текст в интерфейсе — **на узбекском**. Пиши так же.
+
+## Сборка и установка
 
 ```bash
-./setup.sh           # full one-time install: deps → whisper.cpp (Metal) → model → app → login agent
-src/build.sh         # rebuild ONLY the app (use this iterating on dictate.swift / whisper_bridge.c)
-scripts/release.sh   # Developer ID sign + notarize + bundle model + build dist/RubaiSTT-Dictation.dmg
+./src/build.sh      # компиляция -> ~/Applications/RubaiSTT Dictation.app
+./src/install.sh    # УСТАНОВКА -> /Applications (обязательно после build.sh)
 ```
 
-`src/build.sh` requires whisper.cpp static libs to already exist at `whisper.cpp/build-static/` — `setup.sh` produces them. The compiled `.app` lands at `~/Applications/RubaiSTT Dictation.app`. To test changes, run `src/build.sh` then relaunch that app (it's loaded at login via `~/Library/LaunchAgents/com.rubaistt.dictation.plist`).
+**Никогда не останавливайся на `build.sh`.** Он собирает в `~/Applications`, где **нет
+моделей**, а macOS при входе в систему запускает копию из `/Applications`. Если обновить не
+ту копию — после перезагрузки вернётся старая версия. Ровно на этом «всё откатилось» у
+предыдущего агента. `install.sh` кладёт бинарник в `/Applications`, не трогая модели,
+подписывает и перезапускает.
 
-### Distribution (`scripts/release.sh`)
-Produces a signed + notarized DMG for end users (App Store is impossible — system-wide synthetic ⌘V needs Accessibility, which sandboxed MAS apps can't have). The script: builds via `build.sh` → copies the model into `Contents/Resources/ggml-rubaistt.bin` (so the DMG app is fully offline, no `~/rubai-stt` needed) → re-signs with **Developer ID Application** + hardened runtime (`--options runtime`) → notarizes via `notarytool` keychain profile `rubai-notary` (skipped with a warning if absent) → builds the DMG with `create-dmg` (falls back to plain `hdiutil`). DMG background is rendered by `scripts/make_dmg_bg.swift` (headless CoreGraphics → `assets/dmg-bg.png`, gitignored). `dist/` is gitignored.
+Машина владельца — **Intel** (i9-9880H, 8 ядер, 32 ГБ). arm64-библиотек whisper.cpp здесь
+нет, `build.sh` собирает только x86_64. Нужен `libggml-blas.a` (Accelerate), иначе линковка
+падает на `_ggml_backend_blas_reg`.
 
-The model file the app reads is `~/rubai-stt/models/ggml-rubaistt.bin` (q8_0). `setup.sh` fetches a prebuilt one from the GitHub release, falling back to `scripts/convert_model.sh` (downloads from HuggingFace, converts to f16) + `whisper-quantize` → q8_0.
+## Грабли, проверенные замерами
 
-## Architecture
+**1. Metal здесь в 24 раза медленнее CPU.** GPU — AMD Radeon Pro 560X (Metal 2, без
+simdgroup matrix). Замер на medium-модели: CPU 5,8 с против Metal 140 с, плюс 31 секунда
+компиляции шейдеров при каждом старте. `use_gpu = false` — это осознанное решение, не баг.
+Не «чини» его.
 
-Three layers, FFI-bridged:
+**2. Подписывать только сертификатом `RubaiSTT Local Signing`** (самоподписанный, лежит в
+login keychain). При ad-hoc подписи каждая пересборка меняет cdhash, и macOS отзывает
+Accessibility: речь распознаётся, но текст не вставляется, а в логе `AXTrusted=false`.
+`install.sh` это делает сам. Если сертификат пропал — пересоздать:
 
-1. **`src/whisper_bridge.c` / `.h`** — a tiny C shim over whisper.cpp. Holds one global `whisper_context`. Four functions: `rubai_load` / `rubai_unload` / `rubai_transcribe` / `rubai_free_str`. Transcription params are hardcoded here: language `uz`, beam search (size 5), no timestamps, GPU + flash attention on. `rubai_transcribe` mallocs the result string; **the Swift caller must `rubai_free_str` it**.
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 3650 -nodes \
+  -subj "/CN=RubaiSTT Local Signing" -addext "extendedKeyUsage=codeSigning" \
+  -addext "basicConstraints=critical,CA:false"
+openssl pkcs12 -export -inkey k.pem -in c.pem -out c.p12 -passout pass:rubai \
+  -name "RubaiSTT Local Signing" -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
+security import c.p12 -k ~/Library/Keychains/login.keychain-db -P rubai -T /usr/bin/codesign -A
+```
 
-2. **`src/Bridging.h`** — exposes the C header to Swift (`-import-objc-header`). The C functions become globally callable Swift symbols.
+(`-legacy`-параметры обязательны: PKCS12 от OpenSSL 3 macOS не принимает.)
 
-3. **`src/dictate.swift`** — the whole app in one file, organized by `// MARK:`:
-   - `Whisper` (singleton) — wraps the C bridge on a serial dispatch queue; lazy-loads the model on first transcribe; thread count = `activeProcessorCount - 2` (min 4).
-   - `Recorder` — `AVAudioEngine` mic capture, converts hardware format → 16kHz mono float32. **Creates a fresh `AVAudioEngine` on every `start()`** to avoid a stuck-state bug after login / device change.
-   - `Overlay` — borderless non-activating `NSPanel` HUD that shows recording/transcribing status without stealing focus.
-   - `Inserter` — sets clipboard, posts a synthetic ⌘V `CGEvent`, then restores the old clipboard after 0.6s. **Requires Accessibility permission** to send the keystroke.
-   - `HotKeyConfig` / `HotKeyStore` — the hotkey (keyCode + Carbon modifiers + display label) persisted in `UserDefaults`; defaults to ⌃⌥D. `displayString` renders it as e.g. "⌃⌥D".
-   - `HotKey` — Carbon global hotkey → posts `.rubaiHotkey` notification. `install()` mounts the event handler once; `apply(_:)` unregisters the old hotkey and registers the current config (so it can be re-bound at runtime).
-   - `SettingsWindow` — lets the user record a new shortcut (local `keyDown` monitor; requires ≥1 modifier, Esc cancels) and reset to default; calls back via `onChange`.
-   - `LoginItem` — wraps `SMAppService.mainApp` (macOS 13+) for "launch at login" (the modern replacement for the LaunchAgent, used by the distributed DMG app).
-   - `WelcomeWindow` — first-run onboarding HUD: guides Microphone + Accessibility grants (live ✅ status), offers the login-item toggle. Shown once (gated by `didOnboard` in `UserDefaults`).
-   - `AppDelegate` — menu-bar status item (Diktovka / Sozlamalar… / Login'da ishga tushirish / Accessibility / Yo'riqnoma / Chiqish), wires hotkey→`toggle()`. `toggle()` flips record/stop; on stop it transcribes then inserts. After each transcription, an idle timer unloads the model from RAM after **180s**. On first launch shows `WelcomeWindow` and enables the login item.
+**3. Клавиши слушать только через `CGEventTap`.** `NSEvent.addGlobalMonitorForEvents`
+требует **отдельного** разрешения «Мониторинг ввода» и без него молча не отдаёт события —
+выглядит как зависшее приложение. CGEventTap работает от Accessibility, которое и так
+нужно для вставки. Так же устроен Hammerspoon.
 
-### Data flow per dictation
-⌃⌥D → `AppDelegate.toggle` → `Recorder.start` (mic float32 buffer) → ⌃⌥D again → `Recorder.stop` returns `[Float]` → `Whisper.transcribe` (off main thread) → `rubai_transcribe` (Metal) → text back on main thread → `Inserter.insert` (clipboard + ⌘V).
+**4. `temperature_inc` отключать нельзя.** Без fallback узбекская модель зацикливается:
+на записи 3,3 с одна фраза повторилась 9 раз (533 символа). Именно fallback разрывает цикл.
+Цена на нормальной записи: 4,48 → 4,60 с, то есть в пределах шума.
 
-## Things to know before editing
+**5. `no_speech_thold` понижать нельзя.** На 0.45 whisper выбрасывал даже чистую громкую
+речь — текст выходил пустым. Оставлен дефолт 0.6.
 
-- **Two macOS permissions gate functionality**: Microphone (`NSMicrophoneUsageDescription`, requested at first record) and Accessibility (for the synthetic ⌘V — checked via `AXIsProcessTrusted`). The launch agent runs the app via `/usr/bin/open` specifically so TCC permission bindings attach correctly.
-- **The C bridge owns the only whisper context** — it's a process-global, not per-instance. Loading is idempotent; `unload` is called on quit, terminate, and the idle timer.
-- The app bundle's `Info.plist` and ad-hoc `codesign` (with `src/entitlements.plist`: audio-input + allow-jit) are generated inside `src/build.sh` — edit them there, not as standalone files.
-- `whisper.cpp/`, `*.bin`, `.venv/`, `.assets/`, and build artifacts are gitignored — they're fetched/built, never committed.
+**6. `AVAudioEngine.prepare()` заранее роняет приложение.** Попытка держать подготовленный
+движок между записями даёт SIGSEGV: `AVAudioEngineGraph::Initialize` бросает ObjC-исключение,
+Swift его не ловит. Движок создаётся только в момент старта записи.
+
+**7. Более крупная модель для русского не помогает.** Замер на фразе «деплой на Railway и
+базу данных Supabase»: small+подсказка → «деплой на Railway… Supabaise» за 1,33 с;
+medium q5+подсказка → «депло**и** на Railway… Supabaes» за 3,17 с. Качество лечится
+`initial_prompt` со списком терминов, а не размером модели.
+
+## Архитектура
+
+Три файла, FFI-связка:
+
+**`src/whisper_bridge.c`** — шим над whisper.cpp, держит два глобальных контекста
+(uz и ru). Здесь же параметры распознавания: greedy (или beam 3 в «точном» режиме),
+`initial_prompt` со списком терминов, `suppress_nst`, адаптивный `audio_ctx`.
+`rubai_transcribe` возвращает malloc'нутую строку — Swift обязан вызвать `rubai_free_str`.
+
+**`src/Bridging.h`** — открывает C-функции для Swift.
+
+**`src/dictate.swift`** — всё приложение, по `// MARK:`:
+
+- `Whisper` — обёртка над мостом на своей очереди; потоков = число **физических** ядер
+  (гипертрединг замедляет matmul); ищет модель по нескольким путям, чтобы работала любая копия
+- `Recorder` — `AVAudioEngine`, микрофон → 16 кГц моно float32; отдаёт уровень громкости для
+  эквалайзера; `trimSilence` режет тишину по краям, `compressPauses` ужимает паузы >0,5 с
+  до 0,2 с, `peakLevel` определяет «записи не было»
+- `CapsuleView` / `Overlay` — HUD-капсула 126×32 на матовом стекле, эквалайзер с непрерывным
+  течением волны, спиннер при распознавании; кадры 60/с, но перерисовка только при изменении
+- `Inserter` — буфер обмена + синтетический ⌘V; **без Accessibility буфер не восстанавливает**,
+  чтобы текст можно было вставить вручную
+- `CommandTapDetector` — тапы ⌘ через CGEventTap; «грязные» комбинации отсекаются счётчиками
+  `CGEventSource` (не зависят от разрешений); watchdog каждые 15 с + подписка на пробуждение
+  системы восстанавливают tap
+- `AppDelegate` — меню, логика старт/стоп/отмена, `dropHallucination` и `collapseRepeats`
+
+## Постобработка текста
+
+Whisper на тишине выдумывает «[музыка]», «*звук птиц*», «(аплодисменты)» — и это попадало в
+поле ввода. Три уровня защиты:
+
+1. `suppress_nst = true` — подавление не-речевых токенов в декодере
+2. запись с пиком RMS < 0.012 в whisper вообще не отправляется
+3. `dropHallucination` чистит теги **внутри** строки: `[...]` и `*...*` всегда, `(...)` —
+   только если внутри звуковое слово или одно короткое слово (чтобы «(a + b)» уцелело)
+
+`collapseRepeats` схлопывает подряд идущие повторы: одиночные слова от 3 раз, фразы от 2.
+Живое «ha, ha, tushundim» и «juda juda yaxshi» остаются нетронутыми — это проверено.
+
+## Автозапуск (переживает перезагрузку и сон)
+
+- login item через `SMAppService` → `/Applications/RubaiSTT Dictation.app`, одобрен системой
+- `~/Library/LaunchAgents/com.rubaistt.dictation.keepalive.plist` — раз в минуту поднимает
+  приложение через `open`, если процесс умер (проверено: убил — поднялось)
+- watchdog внутри приложения чинит event tap после сна
+
+Hammerspoon **удалён** из системы 25.07.2026 — раньше он ловил Fn и слал приложению ⌃⌥D.
+Вся логика теперь внутри приложения, посредника нет.
+
+## Отладка
+
+```bash
+# ВАЖНО: именно /usr/bin/log — в zsh владельца `log` перехвачен и падает с
+# «too many arguments», из-за чего кажется, будто логов нет
+/usr/bin/log show --last 10m --predicate 'processImagePath CONTAINS "RubaiSTT"' \
+  --style compact | grep '\[rubai\]'
+```
+
+В логе видно всё: старт записи, язык, длину до/после обрезки, время распознавания,
+результат, сработавшие фильтры, `AXTrusted`.
+
+Отчёты о падениях — `~/Library/Logs/DiagnosticReports/RubaiSTTDictation-*.ips`
+(это JSON: первая строка — заголовок, дальше тело).
+
+**Симуляция нажатий** без участия владельца — `tools/simulate-taps.swift`:
+
+```bash
+swiftc -O tools/simulate-taps.swift -o /tmp/taps
+/tmp/taps tap2   # ⌘⌘ — старт (русский)
+/tmp/taps tap3   # ⌘⌘⌘ — старт (узбекский)
+/tmp/taps tap1   # ⌘ — стоп
+/tmp/taps cmdc   # ⌘C дважды — запись НЕ должна начаться
+/tmp/taps hold   # удержание ⌘ — тоже не должна
+```
+
+Тесты и правки проверяй так, а не «должно работать»: почти все баги этой сессии
+(краш, зацикливание, «[музыка]», слетевшие разрешения) нашлись именно прогоном.
+
+## Вкус владельца по интерфейсу
+
+Просит одно и то же направление: **мельче, ниже, плавнее, минималистичнее**. Ориентир —
+Wispr Flow. За две итерации капсула ушла с 248×62 до 126×32. Движение обязано быть
+непрерывным (интерполяция к целевым значениям), рывки он замечает и называет «некрасиво».
+Фон — `NSVisualEffectView` с `maskImage`: при `.behindWindow` слой `cornerRadius` не
+обрезает, вокруг остаётся прямоугольник.
+
+Замечания приходят **надиктованными через само приложение**. Если владелец пишет «не
+превратилось в текст» — ищи его настоящее сообщение в логах, оно там есть.
+
+## Скорость: что уже выжато
+
+Узбекская фраза 11 с: было 10,5 с → стало ~2,5 с. Живая запись 24,2 с ужимается до 16,6 с
+и распознаётся за 1,3 с.
+
+Сделано: greedy вместо beam search (×2,3), потоков = физические ядра, обрезка тишины,
+сжатие пауз, `audio_ctx` по длине записи (+0,5 с запаса), модели постоянно в RAM.
+
+Единственный оставшийся резерв — **распознавать во время речи**, а не после остановки:
+для диктовок по 40–70 с это убрало бы почти всё ожидание. Не сделано: серьёзная переделка
+с риском ошибок на стыках кусков.
