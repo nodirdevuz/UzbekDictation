@@ -498,10 +498,127 @@ final class Overlay {
         return (p, v)
     }
 
+    // MARK: - Kapsula qayerda chiqadi
+
+    /// AX koordinatalari (chap-YUQORI boshlanish, y pastga o'sadi) → AppKit (chap-PAST, y yuqoriga).
+    /// Asos — asosiy displey balandligi: barcha AX-to'rtburchaklar shunga nisbatan beriladi.
+    private func axToAppKit(_ r: CGRect) -> CGRect {
+        let primaryTop = (NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.screens.first)?
+            .frame.maxY ?? 0
+        return CGRect(x: r.origin.x, y: primaryTop - r.maxY, width: r.width, height: r.height)
+    }
+
+    private func axRect(_ el: AXUIElement, _ attr: String) -> CGRect? {
+        var val: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr as CFString, &val) == .success,
+              let v = val, CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
+        var out = CGRect.zero
+        // Pozitsiya va o'lcham alohida atributlar: ikkalasini ham o'qib, to'rtburchak yig'amiz.
+        if attr == kAXPositionAttribute as String {
+            var pt = CGPoint.zero
+            guard AXValueGetValue(v as! AXValue, .cgPoint, &pt) else { return nil }
+            out = CGRect(origin: pt, size: .zero)
+        } else if AXValueGetValue(v as! AXValue, .cgRect, &out) == false {
+            return nil
+        }
+        return out
+    }
+
+    /// Matn kiritish joyi (karetka) yoki faol oyna — ekran koordinatalarida, AppKit tizimida.
+    /// Nil qaytsa — chaqiruvchi sichqoncha ostidagi ekranga qaytadi.
+    private func focusRect() -> CGRect? {
+        guard AXIsProcessTrusted() else { return nil }
+        let sys = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let fr = focusedRef, CFGetTypeID(fr) == AXUIElementGetTypeID() else { return nil }
+        let el = fr as! AXUIElement
+
+        // 1) Karetka: tanlangan matn diapazoni → uning ekrandagi to'rtburchagi.
+        //    Nativ maydonlarda ishlaydi; Electron/veb ilovalarda ko'pincha yo'q — shunda 2-bosqich.
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+           let rr = rangeRef, CFGetTypeID(rr) == AXValueGetTypeID() {
+            var boundsRef: CFTypeRef?
+            if AXUIElementCopyParameterizedAttributeValue(
+                el, kAXBoundsForRangeParameterizedAttribute as CFString, rr, &boundsRef) == .success,
+               let br = boundsRef, CFGetTypeID(br) == AXValueGetTypeID() {
+                var r = CGRect.zero
+                if AXValueGetValue(br as! AXValue, .cgRect, &r), r.height > 0, r.height < 200 {
+                    return axToAppKit(r)
+                }
+            }
+        }
+
+        // 2) Fokusdagi element joylashgan OYNA (Electron/veb uchun ham ishlaydi).
+        var winRef: CFTypeRef?
+        var winEl: AXUIElement?
+        if AXUIElementCopyAttributeValue(el, kAXWindowAttribute as CFString, &winRef) == .success,
+           let wr = winRef, CFGetTypeID(wr) == AXUIElementGetTypeID() {
+            winEl = (wr as! AXUIElement)
+        } else if let app = NSWorkspace.shared.frontmostApplication {
+            // Fokusdagi element oynani bermasa — old plandagi ilovaning faol oynasini so'raymiz.
+            let appEl = AXUIElementCreateApplication(app.processIdentifier)
+            var w: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &w) == .success,
+               let ww = w, CFGetTypeID(ww) == AXUIElementGetTypeID() {
+                winEl = (ww as! AXUIElement)
+            }
+        }
+        if let w = winEl,
+           let pos = axRect(w, kAXPositionAttribute as String),
+           let size = axRect(w, kAXSizeAttribute as String) {
+            let r = CGRect(x: pos.origin.x, y: pos.origin.y, width: size.width, height: size.height)
+            if r.width > 40, r.height > 40 { return axToAppKit(r) }
+        }
+        return nil
+    }
+
+    /// Old plandagi ilovaning eng ustki oynasi — QUARTZ orqali (AX'siz).
+    /// Kerak, chunki hamma ilova ham AX'ni bermaydi: masalan Telegram Desktop (Qt) na karetkani,
+    /// na oynani qaytaradi — o'lchov bilan tasdiqlangan (log: `place src=screen app=Telegram`).
+    /// CGWindowList esa tizim darajasida ishlaydi va har qanday ilovaning oynasini ko'radi.
+    private func frontWindowRect() -> CGRect? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let pid = app.processIdentifier
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return nil }
+        for w in list {                                   // ro'yxat ustki oynadan boshlanadi
+            // ⚠️ Lug'atdagi sonlar — NSNumber. To'g'ridan-to'g'ri `as? pid_t` deb olish HECH QACHON
+            // ishlamaydi (o'lchov: Telegram oynasi topilmay, kapsula ekran pastiga tushib qolgan).
+            guard (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+                  ((w[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1) == 0, // 0 — oddiy oyna
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = b["X"], let y = b["Y"], let ww = b["Width"], let hh = b["Height"],
+                  ww > 120, hh > 120 else { continue }
+            return axToAppKit(CGRect(x: x, y: y, width: ww, height: hh))
+        }
+        return nil
+    }
+
+    /// Kapsula HAR DOIM pastda, o'rtada turadi — egasining talabi 27.07.2026: kursor ortidan
+    /// sakrab yurgani noqulay ("hoh qayerda bosay, pastda, o'rtada chiqsin").
+    /// Karetka/oyna esa baribir kerak, lekin faqat BITTA narsa uchun: qaysi EKRANDA turibmiz.
+    /// Ilgari `NSScreen.main` ishlatilardi — fon ilovasi uchun u deyarli doim ASOSIY ekranni
+    /// qaytaradi, shuning uchun to'liq ekranli ilovada yozayotganda kapsula ish stolida qolib
+    /// ketardi. Ekranni topish tartibi: karetka → AX-oyna → Quartz-oyna → sichqoncha.
     private func place(_ p: NSPanel) {
-        guard let scr = NSScreen.main else { return }
-        let f = scr.visibleFrame
-        p.setFrameOrigin(NSPoint(x: f.midX - W / 2, y: f.minY + 46))
+        let anchor = focusRect() ?? frontWindowRect()
+        let mouse = NSEvent.mouseLocation
+        let screen = anchor.flatMap { r in NSScreen.screens.first { $0.frame.intersects(r) } }
+            ?? NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let scr = screen else { return }
+        let vis = scr.visibleFrame
+
+        // Doimiy joy: pastki chekkadan 46 px yuqorida, gorizontal — markazda.
+        var origin = NSPoint(x: vis.midX - W / 2, y: vis.minY + 46)
+        origin.x = min(max(origin.x, vis.minX + 8), vis.maxX - W - 8)
+        origin.y = min(max(origin.y, vis.minY + 8), vis.maxY - H - 8)
+        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+        NSLog("[rubai] place app=\(app) ekran=\(Int(vis.minX)),\(Int(vis.minY)) \(Int(vis.width))x\(Int(vis.height)) → \(Int(origin.x)),\(Int(origin.y))")
+        p.setFrameOrigin(origin)
     }
 
     func showRecording(lang: String) {
