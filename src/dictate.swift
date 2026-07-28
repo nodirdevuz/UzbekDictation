@@ -464,9 +464,61 @@ final class Overlay {
     // Space'larda (ish stollari va to'liq ekranli oynalar) turishi uchun, .fullScreenAuxiliary —
     // to'liq ekranli oyna yonida yashashi mumkinligi uchun. `.stationary` olib tashlandi: u faqat
     // Exposé uchun kerak edi va foyda bermasdi.
+    //
+    // `spacesMode` — o'zini tuzatish natijasi (pastdagi verifyVisible). 0 — odatdagi yo'l;
+    // 1 — oynani majburan faol Space'ga ko'chirish (agar birinchisi bu tizimda ishlamasa).
+    // Bir marta topilgan ishlaydigan yo'l ESLAB QOLINADI, shuning uchun keyingi safar kapsula
+    // darrov to'g'ri joyda chiqadi va "avval noto'g'ri, keyin tuzaladi" miltillashi bo'lmaydi.
+    private var spacesMode = 0
+
     private func applySpaces(_ p: NSPanel) {
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        p.collectionBehavior = spacesMode == 0
+            ? [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+            : [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
         p.level = capsuleLevel
+    }
+
+    /// Kapsula HAQIQATAN ekranda ko'rinyaptimi — tekshiramiz va o'zimizni tuzatamiz.
+    ///
+    /// ⚠️ NEGA KERAK. Oyna qaysi Space'da chizilishi macOS ning ichki qarori: u hujjatlashtirilmagan
+    /// va versiyadan versiyaga o'zgaradi. 27.07 monitor tanlash tuzatildi, 28.07 esa o'sha kapsula
+    /// to'liq ekranli oynada ko'rinmay qoldi — bayroqlar "to'g'ri" bo'lsa ham. Shuning uchun endi
+    /// bayroqqa ISHONMAYMIZ, balki NATIJANI o'lchaymiz: oyna faol Space ro'yxatida bormi.
+    /// Yo'q bo'lsa — zinapoya bo'yicha tuzatamiz va ishlagan usulni eslab qolamiz.
+    private func verifyVisible(_ p: NSPanel, attempt: Int = 0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, p.isVisible else { return }
+            if self.isOnScreen(p) {
+                if attempt > 0 { NSLog("[rubai] kapsula \(attempt)-chora bilan ko'rindi (spacesMode=\(self.spacesMode))") }
+                return
+            }
+            switch attempt {
+            case 0:
+                // 1-chora: majburan faol Space'ga ko'chirish. Buni ESLAB QOLAMIZ.
+                self.spacesMode = 1
+                p.orderOut(nil)
+                self.applySpaces(p)
+                p.orderFrontRegardless()
+            case 1:
+                // 2-chora: mumkin bo'lgan eng yuqori daraja.
+                p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.maximumWindow)))
+                p.orderFrontRegardless()
+            default:
+                // Diktovkaning o'zi ishlayveradi — matn baribir qo'yiladi, faqat kapsula ko'rinmaydi.
+                NSLog("[rubai] kapsulani ko'rsatib bo'lmadi — diktovka ishlashda davom etadi")
+                return
+            }
+            self.verifyVisible(p, attempt: attempt + 1)
+        }
+    }
+
+    /// Oyna faol Space'da chizilyaptimi. ⚠️ Qiymatlar NSNumber — to'g'ridan-to'g'ri `as? UInt32`
+    /// jimgina nil beradi (27.07 da aynan shu tuzoqqa tushgan edik kCGWindowOwnerPID bilan).
+    private func isOnScreen(_ p: NSPanel) -> Bool {
+        let num = UInt32(max(0, p.windowNumber))
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+        else { return true }   // ro'yxatni ololmadik — tuzatishga urinmaymiz, yomonlashtirmaylik
+        return list.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == num }
     }
 
     private func ensurePanel() -> (NSPanel, CapsuleView) {
@@ -687,6 +739,7 @@ final class Overlay {
             p.alphaValue = 1
             p.orderFrontRegardless()
         }
+        verifyVisible(p)   // ko'rsatdik deb ishonmaymiz — tekshiramiz
     }
 
     // Bitta 60 Hz taymer: to'lqin nishon qiymatlarga silliq intiladi (lerp),
