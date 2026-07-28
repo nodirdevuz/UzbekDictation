@@ -453,14 +453,28 @@ final class Overlay {
     var onCancel: (() -> Void)?
     var onAccept: (() -> Void)?
 
+    // ⚠️ DARAJA: aynan .screenSaver, CGShieldingWindowLevel EMAS.
+    // Shielding darajasidagi oyna ish stoli Space'ining kompozitsiyasiga tegishli va boshqa
+    // ilovaning TO'LIQ EKRANLI Space'ida umuman chizilmaydi — egasi 28.07 shundan shikoyat qildi:
+    // to'liq ekranli Claude'da diktovka ishlaydi, lekin kapsula ko'rinmaydi (u ish stolida qoladi).
+    // .screenSaver to'liq ekranli oyna ustida ham chiziladi va Space'lar bilan to'g'ri ishlaydi.
+    private let capsuleLevel = NSWindow.Level.screenSaver
+
+    // ⚠️ HAR SAFAR ko'rsatishdan oldin qayta qo'yiladi: .canJoinAllSpaces — kapsula BARCHA
+    // Space'larda (ish stollari va to'liq ekranli oynalar) turishi uchun, .fullScreenAuxiliary —
+    // to'liq ekranli oyna yonida yashashi mumkinligi uchun. `.stationary` olib tashlandi: u faqat
+    // Exposé uchun kerak edi va foyda bermasdi.
+    private func applySpaces(_ p: NSPanel) {
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        p.level = capsuleLevel
+    }
+
     private func ensurePanel() -> (NSPanel, CapsuleView) {
         if let p = panel, let v = view { return (p, v) }
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                         styleMask: [.nonactivatingPanel, .borderless],
                         backing: .buffered, defer: false)
-        // Eng yuqori daraja — to'liq ekranli oynalar (foto ko'ruvchi, video)
-        // ustidan ham ko'rinsin.
-        p.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) - 1)
+        p.level = capsuleLevel
         p.isFloatingPanel = true
         p.hidesOnDeactivate = false
         p.backgroundColor = .clear
@@ -468,7 +482,7 @@ final class Overlay {
         p.hasShadow = true             // tizim soyasi — yumshoqroq
         p.ignoresMouseEvents = false
         p.appearance = NSAppearance(named: .vibrantDark)
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        applySpaces(p)
 
         // Matoviy shisha fon (orqadagi tasvirni xiralashtiradi)
         let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: W, height: H))
@@ -661,6 +675,7 @@ final class Overlay {
     }
 
     private func appear(_ p: NSPanel) {
+        applySpaces(p)   // Space'ga oid xatti-harakat ba'zan tiklanadi — har safar qayta qo'yamiz
         if !p.isVisible {
             p.alphaValue = 0
             p.orderFrontRegardless()
