@@ -1,5 +1,7 @@
 import SwiftUI
 import AVFoundation
+import CoreAudio
+import AudioToolbox
 import AppKit
 import Carbon.HIToolbox
 import ApplicationServices
@@ -110,16 +112,104 @@ final class Whisper {
     var isLoaded: Bool { loaded }
 }
 
+// MARK: - Kirish qurilmalari (qaysi mikrofondan yozamiz)
+
+// Tizimdagi "standart kirish" bizga to'g'ri kelmaydi: Bluetooth-garnitura
+// ulanishi bilanoq macOS uni standart qilib qo'yadi, garnitura esa mikrofon
+// rejimida (HFP) 8 kHz beradi — whisper uchun bu deyarli shovqin. Yomoni ham
+// bor: 02.08.2026 da M-106BT garnitura umuman JIMLIK berdi (ffmpeg bilan
+// o'lchandi: max_volume −91 dB, ya'ni toza nol), diktovka esa "qotib qolgandek"
+// ko'rindi — kapsuladagi ekvalayzer qimirlamadi, chunki daraja rostdan ham nol.
+// Shuning uchun mikrofonni O'ZIMIZ tanlaymiz: ichki mikrofon bor bo'lsa — u.
+enum InputDevice {
+
+    static func name(_ id: AudioDeviceID) -> String {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cf: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &cf) == noErr,
+              let s = cf?.takeRetainedValue() else { return "?" }
+        return s as String
+    }
+
+    private static func inputChannels(_ id: AudioDeviceID) -> Int {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr, size > 0 else { return 0 }
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+        defer { buf.deallocate() }
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, buf) == noErr else { return 0 }
+        let abl = UnsafeMutableAudioBufferListPointer(buf.assumingMemoryBound(to: AudioBufferList.self))
+        return abl.reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+
+    private static func transportType(_ id: AudioDeviceID) -> UInt32 {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var t: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &t)
+        return t
+    }
+
+    private static func all() -> [AudioDeviceID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                             &addr, 0, nil, &size) == noErr else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids
+    }
+
+    // Ichki mikrofon. Topilmasa — nil, o'shanda tizim standartida qolamiz.
+    static func builtIn() -> AudioDeviceID? {
+        all().first { inputChannels($0) > 0 && transportType($0) == kAudioDeviceTransportTypeBuiltIn }
+    }
+}
+
 // MARK: - Mikrofon (16kHz mono float32)
 
 final class Recorder {
     private var engine = AVAudioEngine()
     private var converter: AVAudioConverter?
+    private var convFrom: AVAudioFormat?   // konverter qaysi formatga yig'ilgan
     private let target = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                        sampleRate: 16000, channels: 1, interleaved: false)!
     private var samples: [Float] = []
     private let lock = NSLock()
     private(set) var isRecording = false
+
+    // Qaysi mikrofondan yozyapmiz — xabar va log uchun.
+    private(set) var deviceName = "?"
+
+    // Har yozuvning o'z raqami: kechikkan tekshiruv keyingi yozuvni urmasin.
+    private(set) var sessionNo = 0
+
+    // Hech bo'lmasa bitta noldan farqli sample keldimi. Jim mikrofon (uzilgan
+    // Bluetooth-transport) toza nol beradi, tirik mikrofon esa hech qachon —
+    // hatto jim xonada ham shovqin bor. Shu farq bilan "mikrofon o'lik"ligini
+    // yozuv oxirini kutmasdan, 1,5 soniyada bilamiz.
+    private var sound = false
+    var sawSound: Bool { lock.lock(); defer { lock.unlock() }; return sound }
+
+    // Diagnostika: yozuv boshi, kelgan bufer soni. "Bufer umuman kelmadi" bilan
+    // "buferlar keldi, lekin ichi nol" — bular boshqa-boshqa nosozliklar.
+    private var startedAt = Date()
+    private var bufCount = 0
+    var buffersSeen: Int { lock.lock(); defer { lock.unlock() }; return bufCount }
 
     // Ovoz balandligi (0…1) — ekvalayzer animatsiyasi uchun.
     var onLevel: ((Float) -> Void)?
@@ -145,13 +235,53 @@ final class Recorder {
         // AVAudioEngineGraph::Initialize ObjC-istisno tashlaydi, Swift uni ushlay
         // olmaydi va ilova qulaydi (SIGSEGV, 25.07.2026 da tekshirildi).
         engine = AVAudioEngine()
+        sessionNo += 1
+        startedAt = Date()
+        lock.lock(); sound = false; bufCount = 0; lock.unlock()
         let input = engine.inputNode
-        let hw = input.outputFormat(forBus: 0)
+
+        // Mikrofonni tizim tanlashiga qoldirmaymiz — ichki mikrofonni o'zimiz
+        // qo'yamiz (sabab InputDevice izohida). Qurilma FORMATNI o'qishdan oldin
+        // qo'yilishi shart, aks holda konverter eski qurilma formatida qoladi.
+        if let dev = InputDevice.builtIn() {
+            do {
+                // setDeviceID — AVAudioEngine'ning o'z yo'li (AudioUnitSetProperty
+                // ham qurilmani qo'yadi, lekin bu API xatoni qaytaradi va tugun
+                // formati bilan kelishilgan). Formatni qanday o'qish kerakligi —
+                // pastdagi izohda: bu yerda eng oson yiqiladigan joy.
+                try input.auAudioUnit.setDeviceID(dev)
+                deviceName = InputDevice.name(dev)
+            } catch {
+                deviceName = "\(InputDevice.name(dev)) (qo'yilmadi: \(error.localizedDescription))"
+            }
+        } else {
+            deviceName = "tizim standarti"
+        }
+
+        // Format AYNAN inputFormat'dan olinadi, outputFormat'dan emas.
+        // 02.08.2026 da o'lchandi: qurilmani o'zimiz qo'yganimizdan keyin
+        //   inputFormat  = 48000 Hz  (qurilmaning haqiqiy formati)
+        //   outputFormat = 44100 Hz  (tugunning eski, yangilanmagan formati)
+        // installTap esa qurilma formatini talab qiladi — outputFormat bilan u
+        // "Input HW format and tap format not matching" deb yiqilardi va yozuv
+        // umuman boshlanmasdi (ilova tirik, lekin ovoz yozilmaydi).
+        var hw = input.inputFormat(forBus: 0)
+        if hw.sampleRate <= 0 { hw = input.outputFormat(forBus: 0) }
         guard hw.sampleRate > 0 else { return false }
+        NSLog("[rubai] mikrofon: \(deviceName) — \(Int(hw.sampleRate)) Hz, \(hw.channelCount) kanal")
         converter = AVAudioConverter(from: hw, to: target)
+        convFrom = hw
         input.installTap(onBus: 0, bufferSize: 4096, format: hw) { [weak self] buf, _ in
-            guard let self = self, let conv = self.converter else { return }
-            let ratio = self.target.sampleRate / hw.sampleRate
+            guard let self = self else { return }
+            // Format baribir boshqacha kelsa (qurilma yozuv ustida almashsa),
+            // konverterni qayta yig'amiz: bu bo'lakni yo'qotgandan afzal.
+            if self.convFrom == nil || !self.convFrom!.isEqual(buf.format) {
+                self.converter = AVAudioConverter(from: buf.format, to: self.target)
+                self.convFrom = buf.format
+                NSLog("[rubai] kirish formati o'zgardi -> \(Int(buf.format.sampleRate)) Hz")
+            }
+            guard let conv = self.converter else { return }
+            let ratio = self.target.sampleRate / buf.format.sampleRate
             let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 1024
             guard let out = AVAudioPCMBuffer(pcmFormat: self.target, frameCapacity: cap) else { return }
             var fed = false; var err: NSError?
@@ -163,7 +293,16 @@ final class Recorder {
                 let n = Int(out.frameLength)
                 self.lock.lock()
                 self.samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: n))
+                self.bufCount += 1
+                // Tirik mikrofonmi. Faqat birinchi ovoz kelgunga qadar sanaymiz.
+                var firstSound = false
+                if !self.sound {
+                    for i in 0..<n where ch[0][i] != 0 { self.sound = true; firstSound = true; break }
+                }
                 self.lock.unlock()
+                if firstSound {
+                    NSLog("[rubai] birinchi ovoz: \(String(format: "%.2f", Date().timeIntervalSince(self.startedAt)))s")
+                }
 
                 // RMS -> daraja. Sekundiga ~30 marta yuboramiz (CPU'ni bekorga isitmaslik uchun).
                 if self.onLevel != nil, n > 0, Date().timeIntervalSince(self.lastLevelSent) > 0.033 {
@@ -1736,9 +1875,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.streamingNow = self.streaming
                 if self.streamingNow { self.stream.begin() }
                 self.overlay.showRecording(lang: l)
+                self.watchSilentMic()
             } else {
                 self.overlay.flash("Mikrofonga ruxsat yo'q", seconds: 2.0)
             }
+        }
+    }
+
+    // Mikrofon o'lik bo'lsa — buni YOZUV OXIRIDA emas, darrov aytamiz.
+    // 02.08.2026: Bluetooth-garnitura ulanib, transport ko'tarilmagan edi —
+    // tizim ilovaga toza nol berdi. Kapsuladagi ekvalayzer qimirlamadi va bu
+    // "ilova qotib qoldi"dek ko'rindi; egasi 88 soniya bekorga gapirdi, xato
+    // esa faqat ⌘ bosilgandan keyin ko'rindi.
+    private func watchSilentMic(after: TimeInterval = 1.5, lastChance: Bool = false) {
+        let no = rec.sessionNo
+        DispatchQueue.main.asyncAfter(deadline: .now() + after) { [weak self] in
+            guard let self = self,
+                  self.rec.isRecording, self.rec.sessionNo == no, !self.rec.sawSound else { return }
+
+            // Bufer umuman kelmagan bo'lsa — bu hali "o'lik mikrofon" degani emas:
+            // CoreAudio qurilma almashganda qayta qurilib, birinchi buferni
+            // kechiktirishi mumkin (odatda 0.3 s, lekin qayta qurilishda ko'proq).
+            // Buferlar kelyapti-yu, ichi toza nol bo'lsa — mana bu o'lik kanal.
+            if self.rec.buffersSeen == 0 && !lastChance {
+                self.watchSilentMic(after: 2.0, lastChance: true)
+                return
+            }
+
+            NSLog("[rubai] mikrofon jim: \(self.rec.deviceName) — ovoz yo'q (bufer: \(self.rec.buffersSeen))")
+            _ = self.rec.stop()
+            if self.streamingNow { self.stream.abort(); self.streamingNow = false }
+            self.startedByTapSeries = false
+            self.taps.resetSeries()
+            self.overlay.flash("Mikrofon jim", seconds: 2.5)   // qurilma nomi logda
         }
     }
 
