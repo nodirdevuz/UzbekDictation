@@ -60,9 +60,15 @@ final class Whisper {
     // Bo'lak sekinroq tanilsa ham zarari yo'q: u navbatdagi vaqtdan yeydi, kutishdan emas.
     static var backgroundThreads: Int32 { max(2, threads / 2) }
 
+    // accurate: nil = menyudagi sozlama, true/false = majburan.
+    // fullCtx: qisqa bo'laklarda aniqlikni saqlaydi (fon bo'laklari uchun).
+    // prompt: oldingi bo'lakning oxiri — chegarada so'z buzilmasligi uchun.
     func transcribe(_ samples: [Float],
                     threads: Int32 = Whisper.threads,
                     qos: DispatchQoS = .userInitiated,
+                    accurate: Bool? = nil,
+                    fullCtx: Bool = false,
+                    prompt: String? = nil,
                     tag: String = "",
                     done: @escaping (String) -> Void,
                     fail: @escaping (String) -> Void = { _ in }) {
@@ -81,8 +87,10 @@ final class Whisper {
             }
             let t0 = Date()
             var text = ""
+            let acc: Int32 = accurate == nil ? -1 : (accurate! ? 1 : 0)
             samples.withUnsafeBufferPointer { buf in
-                if let c = rubai_transcribe(buf.baseAddress, Int32(buf.count), threads) {
+                if let c = rubai_transcribe(buf.baseAddress, Int32(buf.count), threads,
+                                            acc, fullCtx ? 1 : 0, prompt) {
                     text = String(cString: c).trimmingCharacters(in: .whitespacesAndNewlines)
                     rubai_free_str(c)
                 }
@@ -269,6 +277,11 @@ final class StreamTranscriber {
             cursor = all.count
             tailSec = Double(tail.count) / 16000.0
             // 0.35 s dan qisqa dum — bu pauzaning quyrug'i, tanishga hojat yo'q.
+            //
+            // Dum — odam KUTIB turgan yagona qism, shuning uchun eng tez sozlama:
+            // greedy va uzunlikka moslangan audio_ctx. To'liq audio_ctx bu yerda
+            // o'lchandi: 3.3 s dumga 2.85 s (5 barobar qimmat) — hammasini yeb
+            // qo'yadi. Aniqlikni esa oldingi bo'lak matni (prompt) ko'taradi.
             if tail.count >= Int(0.35 * 16000) {
                 submit(tail, threads: Whisper.threads, qos: .userInitiated)
             }
@@ -315,12 +328,24 @@ final class StreamTranscriber {
                 guard gen == self.generation, self.cursor == from, let cut = cut else { return }
                 NSLog("[rubai] kesish: \(String(format: "%.1f", Double(cut.at) / 16000.0))s — \(cut.why.rawValue), pauza \(String(format: "%.1f", cut.pause))s, rms=\(String(format: "%.4f", cut.level))")
                 self.cursor = from + cut.at
-                self.submit(Array(tail[0..<cut.at]), threads: Whisper.backgroundThreads, qos: .utility)
+                // Fon bo'lagi: odam hali gapiryapti, ya'ni vaqt baribir bo'sh
+                // turardi — shuning uchun ANIQ rejim va to'liq audio_ctx.
+                self.submit(Array(tail[0..<cut.at]), threads: Whisper.backgroundThreads,
+                            qos: .utility, accurate: true, fullCtx: true)
             }
         }
     }
 
-    private func submit(_ raw: [Float], threads: Int32, qos: DispatchQoS) {
+    // Oldingi bo'lakning oxiri — keyingisiga old matn sifatida beriladi.
+    // Bo'lak chegarasida dekoder gap boshini bilmay qolmasligi uchun.
+    private func promptTail() -> String? {
+        guard let last = parts.last(where: { !$0.isEmpty }) else { return nil }
+        return last.count > 200 ? String(last.suffix(200)) : last
+    }
+
+    private func submit(_ raw: [Float], threads: Int32, qos: DispatchQoS,
+                        accurate: Bool? = nil, fullCtx: Bool = false) {
+        let prompt = promptTail()
         let idx = parts.count
         parts.append("")
         chunkNo += 1
@@ -336,7 +361,9 @@ final class StreamTranscriber {
         }
 
         let audio = Audio.prepare(raw)
-        Whisper.shared.transcribe(audio, threads: threads, qos: qos, tag: " #\(no)") { [weak self] text in
+        Whisper.shared.transcribe(audio, threads: threads, qos: qos,
+                                  accurate: accurate, fullCtx: fullCtx,
+                                  prompt: prompt, tag: " #\(no)") { [weak self] text in
             NSLog("[rubai] bo'lak #\(no) matni: '\(text)'")
             guard let self = self, gen == self.generation, idx < self.parts.count else { return }
             self.parts[idx] = text

@@ -18,7 +18,14 @@ void rubai_unload(void);
 
 // 16kHz mono float32 namunalardan matn qaytaradi.
 // Qaytgan satrni rubai_free_str bilan bo'shating. NULL = xato.
-char *rubai_transcribe(const float *samples, int n_samples, int n_threads);
+//
+//   accurate  : -1 = menyudagi sozlama, 0 = greedy, 1 = beam search 3
+//   full_ctx  :  0 = audio_ctx yozuv uzunligiga moslanadi (tezroq),
+//                1 = to'liq 1500 (aniqroq — qisqa bo'laklarda sezilarli)
+//   prompt    : NULL bo'lmasa — dekoderga old matn (oldingi bo'lak oxiri).
+//               Bo'laklar chegarasida so'zlar buzilmasligi uchun.
+char *rubai_transcribe(const float *samples, int n_samples, int n_threads,
+                       int accurate, int full_ctx, const char *prompt);
 
 void rubai_free_str(char *s);
 
