@@ -178,6 +178,67 @@ enum InputDevice {
     static func builtIn() -> AudioDeviceID? {
         all().first { inputChannels($0) > 0 && transportType($0) == kAudioDeviceTransportTypeBuiltIn }
     }
+
+    static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+        let t = transportType(id)
+        return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    static var systemInput: AudioDeviceID {
+        get {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var id: AudioDeviceID = 0
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+            return id
+        }
+        set {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var v = newValue
+            AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                       UInt32(MemoryLayout<AudioDeviceID>.size), &v)
+        }
+    }
+
+    // Bluetooth kolonka MIKROFON bo'lib qolmasin. macOS uni ulanishi bilan
+    // "standart kirish" qilib qo'yadi va ikki zarar keltiradi:
+    //   1) diktovka: kolonka mikrofoni jim qolishi mumkin (02.08.2026, M-106BT)
+    //      yoki eng yaxshi holatda 8 kHz beradi — whisper uchun deyarli shovqin;
+    //   2) musiqa: mikrofoni band bo'lgani uchun kolonka HFP rejimiga tushadi va
+    //      8 kHz da "telefon ovozi" bilan chalinadi.
+    // Ikkalasi ham bitta harakat bilan davolanadi — kirishni ichki mikrofonga
+    // qaytarish. Egasining talabi ham shu: "bluetooth — kolonka, eshitish — Mac".
+    @discardableResult
+    static func keepSystemInputOffBluetooth() -> Bool {
+        let cur = systemInput
+        guard isBluetooth(cur), let mac = builtIn(), mac != cur else { return false }
+        systemInput = mac
+        NSLog("[rubai] tizim kirishi \(name(cur)) (bluetooth) dan \(name(mac)) ga qaytarildi")
+        return true
+    }
+
+    // Kolonka har ulanganda macOS uni yana kirish qilib qo'yadi — shuning uchun
+    // bir marta tuzatish yetmaydi, o'zgarishni kuzatib turamiz. O'zimiz qo'ygan
+    // qiymat ham hodisa keltiradi, lekin u BT bo'lmagani uchun tsikl bo'lmaydi.
+    private static var listening = false
+    static func watchSystemInput() {
+        guard !listening else { return }
+        listening = true
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                            &addr, DispatchQueue.main) { _, _ in
+            keepSystemInputOffBluetooth()
+        }
+    }
 }
 
 // MARK: - Mikrofon (16kHz mono float32)
@@ -228,6 +289,12 @@ final class Recorder {
 
     private func begin() -> Bool {
         lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+
+        // Bluetooth kolonka kirishni egallab olgan bo'lsa — qaytarib olamiz.
+        // Bu shunchaki "toza"lik uchun emas: kirish BT'da turganda CoreAudio
+        // HFP'ga o'tish bilan band bo'lib, bizning grafimizga bitta ham bufer
+        // bermay qo'yishi o'lchandi (02.08.2026, "bufer: 0").
+        InputDevice.keepSystemInputOffBluetooth()
         // Har yozishda YANGI engine — login'da/qurilma o'zgarganda qotib qolgan
         // (jim, "musiqa") holatdan saqlaydi.
         //
@@ -324,6 +391,20 @@ final class Recorder {
         do { try engine.start() } catch { return false }
         isRecording = true
         return true
+    }
+
+    // Graf ishga tushdi, lekin bitta ham bufer bermadi — CoreAudio o'sha payt
+    // qurilma almashtirish bilan band bo'lgan. Grafni qaytadan yig'amiz:
+    // yo'qotadigan narsa yo'q (bufer kelmagan), yozuv esa davom etadi.
+    @discardableResult
+    func restartEngine() -> Bool {
+        guard isRecording else { return false }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        isRecording = false
+        let ok = begin()
+        NSLog("[rubai] audio grafi qayta yig'ildi: \(ok ? "ok" : "muvaffaqiyatsiz")")
+        return ok
     }
 
     func stop() -> [Float] {
@@ -1764,6 +1845,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar (Dock'da yo'q)
 
+        // Bluetooth kolonka mikrofon bo'lib qolmasin — diktovka boshlanishini
+        // kutmasdan, hozirdanoq. Kolonka HFP'dan chiqadi va musiqa ham tiniq
+        // chalinadi (HFP'da u 8 kHz — "telefon ovozi").
+        InputDevice.keepSystemInputOffBluetooth()
+        InputDevice.watchSystemInput()
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "rubaiSTT")
         let menu = NSMenu()
@@ -1894,10 +1981,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   self.rec.isRecording, self.rec.sessionNo == no, !self.rec.sawSound else { return }
 
             // Bufer umuman kelmagan bo'lsa — bu hali "o'lik mikrofon" degani emas:
-            // CoreAudio qurilma almashganda qayta qurilib, birinchi buferni
-            // kechiktirishi mumkin (odatda 0.3 s, lekin qayta qurilishda ko'proq).
+            // CoreAudio qurilma almashuvi ustida bo'lsa (masalan Bluetooth kolonka
+            // HFP'ga o'tayotgan bo'lsa) grafimizga umuman bufer bermaydi. Bunda
+            // grafni qayta yig'ib, yana bir imkon beramiz — odam buni sezmaydi ham.
             // Buferlar kelyapti-yu, ichi toza nol bo'lsa — mana bu o'lik kanal.
-            if self.rec.buffersSeen == 0 && !lastChance {
+            if self.rec.buffersSeen == 0 && !lastChance, self.rec.restartEngine() {
                 self.watchSilentMic(after: 2.0, lastChance: true)
                 return
             }
