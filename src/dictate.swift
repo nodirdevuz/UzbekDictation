@@ -55,9 +55,18 @@ final class Whisper {
 
     func setLanguage(_ lang: String) { rubai_set_language(lang) }
 
-    func transcribe(_ samples: [Float], done: @escaping (String) -> Void,
+    // Fon bo'laklari uchun yadrolarning yarmi: odam shu payt gapiryapti va
+    // shu mashinada ishlayapti ham — 8 yadroni to'liq band qilish sezilib qoladi.
+    // Bo'lak sekinroq tanilsa ham zarari yo'q: u navbatdagi vaqtdan yeydi, kutishdan emas.
+    static var backgroundThreads: Int32 { max(2, threads / 2) }
+
+    func transcribe(_ samples: [Float],
+                    threads: Int32 = Whisper.threads,
+                    qos: DispatchQoS = .userInitiated,
+                    tag: String = "",
+                    done: @escaping (String) -> Void,
                     fail: @escaping (String) -> Void = { _ in }) {
-        q.async {
+        q.async(qos: qos) {
             if !self.loaded {
                 guard let mp = self.modelPath() else {
                     NSLog("[rubai] XATO: model fayli topilmadi (bundle/uy)")
@@ -73,14 +82,20 @@ final class Whisper {
             let t0 = Date()
             var text = ""
             samples.withUnsafeBufferPointer { buf in
-                if let c = rubai_transcribe(buf.baseAddress, Int32(buf.count), Whisper.threads) {
+                if let c = rubai_transcribe(buf.baseAddress, Int32(buf.count), threads) {
                     text = String(cString: c).trimmingCharacters(in: .whitespacesAndNewlines)
                     rubai_free_str(c)
                 }
             }
-            NSLog("[rubai] transcribe: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s / audio \(String(format: "%.1f", Double(samples.count) / 16000.0))s")
+            NSLog("[rubai] transcribe\(tag): \(String(format: "%.2f", Date().timeIntervalSince(t0)))s / audio \(String(format: "%.1f", Double(samples.count) / 16000.0))s")
             DispatchQueue.main.async { done(text) }
         }
+    }
+
+    // Navbat bo'shaganini kutish. Navbat ketma-ket, shuning uchun bu blok
+    // undan oldin qo'yilgan barcha bo'laklardan keyin ishlaydi.
+    func barrier(qos: DispatchQoS = .userInitiated, _ done: @escaping () -> Void) {
+        q.async(qos: qos) { DispatchQueue.main.async(execute: done) }
     }
 
     func unload() { q.async { if self.loaded { rubai_unload(); self.loaded = false } } }
@@ -173,82 +188,165 @@ final class Recorder {
         return s
     }
 
-    private static let win = 320          // 20 ms oyna
+    // MARK: - Oqimli o'qish (gapirayotganda tanish uchun)
 
-    // Oynalar bo'yicha RMS
-    private static func envelope(_ s: [Float]) -> [Float] {
-        var rms = [Float](); rms.reserveCapacity(s.count / win)
-        var i = 0
-        while i + win <= s.count {
-            var sum: Float = 0
-            for j in i..<(i + win) { let v = s[j]; sum += v * v }
-            rms.append(sqrt(sum / Float(win)))
-            i += win
-        }
-        return rms
+    // Yozishni to'xtatmasdan — shu paytgacha nechta sample yig'ilgani.
+    var sampleCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return samples.count
     }
 
-    // Boshi va oxiridagi jimlikni kesish: koder oynasi qisqaradi -> tezroq.
-    static func trimSilence(_ s: [Float]) -> [Float] {
-        guard s.count > win * 4 else { return s }
-        let rms = envelope(s)
-        let peak = rms.max() ?? 0
-        guard peak > 0.004 else { return s }              // butunlay jim — tegmaymiz
-        let thr = max(0.006, peak * 0.08)
-        guard let first = rms.firstIndex(where: { $0 > thr }),
-              let last  = rms.lastIndex(where: { $0 > thr }) else { return s }
-        let from = max(0, (first * win) - Int(0.08 * 16000))
-        let to   = min(s.count, ((last + 1) * win) + Int(0.15 * 16000))
-        guard to > from else { return s }
-        return Array(s[from..<to])
+    // [from..<to] oralig'ining nusxasi; yozish davom etaveradi.
+    func slice(from: Int, to: Int) -> [Float] {
+        lock.lock(); defer { lock.unlock() }
+        let a = max(0, min(from, samples.count))
+        let b = max(a, min(to, samples.count))
+        return Array(samples[a..<b])
     }
 
-    // Uzun ichki pauzalarni qisqartirish. Koder har soniya uchun to'laydi,
-    // shuning uchun 0.7 s dan uzun jimliklarni 0.25 s ga siqamiz — matn
-    // o'zgarmaydi, lekin uzun diktovkalar sezilarli tez tanilади.
-    static func compressPauses(_ s: [Float]) -> [Float] {
-        guard s.count > 16000 * 3 else { return s }       // 3 s dan qisqa — tegmaymiz
-        let rms = envelope(s)
-        let peak = rms.max() ?? 0
-        guard peak > 0.004 else { return s }
-        let thr = max(0.006, peak * 0.08)
-        let maxPauseWins = Int(0.5 * 16000) / win
-        let keepWins     = Int(0.2 * 16000) / win
+}
 
-        var out = [Float](); out.reserveCapacity(s.count)
-        var i = 0
-        while i < rms.count {
-            if rms[i] > thr {
-                let from = i * win
-                out.append(contentsOf: s[from..<min(from + win, s.count)])
-                i += 1
-            } else {
-                var j = i
-                while j < rms.count && rms[j] <= thr { j += 1 }
-                let keep = (j - i) > maxPauseWins ? keepWins : (j - i)
-                let from = i * win
-                let to = min(from + keep * win, s.count)
-                if to > from { out.append(contentsOf: s[from..<to]) }
-                i = j
+// MARK: - Oqimli tanish (gapirayotganda)
+
+// Diktovka tugashini kutmaydi: yozib olingan qismni pauzalar bo'yicha bo'laklarga
+// ajratib, whisper'ga fonda beradi. ⌘ bosilganda faqat DUM — oxirgi jumla — qoladi,
+// shuning uchun kutish diktovka uzunligiga qarab o'smaydi.
+//
+// Butun holat FAQAT main oqimida o'zgaradi (taymer ham, whisper javoblari ham
+// main'ga keladi) — shuning uchun bu yerda lock kerak emas. Og'ir hisob
+// (kesish nuqtasini izlash) fon oqimiga chiqarilgan, chunki main'da kapsula
+// 60 kadr/s chiziladi.
+final class StreamTranscriber {
+    private let rec: Recorder
+
+    // Bir diktovka = bir "avlod". Til almashsa yoki bekor qilinsa avlod ortadi,
+    // yo'lda qolgan bo'laklarning javoblari e'tiborsiz qoladi.
+    private var generation = 0
+    private var cursor = 0             // nechta sample tanishga topshirilgan
+    private var parts: [String] = []   // natijalar — topshirilgan tartibda
+    private var chunkNo = 0
+    private var scanning = false
+    private var timer: DispatchSourceTimer?
+
+    init(_ rec: Recorder) { self.rec = rec }
+
+    var chunksSubmitted: Int { parts.count }
+
+    // MARK: hayot sikli
+
+    func begin() {
+        generation += 1
+        cursor = 0
+        parts = []
+        chunkNo = 0
+        scanning = false
+        startTimer()
+    }
+
+    // Til yozish ustida almashdi (⌘⌘⌘) — tanilganlar boshqa tilda, hammasini
+    // boshidan qayta tanish kerak.
+    func restart() {
+        generation += 1
+        cursor = 0
+        parts = []
+        NSLog("[rubai] oqim: til almashdi — bo'laklar bekor qilindi")
+    }
+
+    func abort() {
+        generation += 1
+        cursor = 0
+        parts = []
+        stopTimer()
+    }
+
+    // ⌘ bosildi. `all` — butun yozuv; undan faqat topshirilmagan dum olinadi.
+    func finish(all: [Float], done: @escaping (String, Int) -> Void) {
+        stopTimer()
+        let gen = generation
+        var tailSec = 0.0
+        if cursor < all.count {
+            let tail = Array(all[cursor...])
+            cursor = all.count
+            tailSec = Double(tail.count) / 16000.0
+            // 0.35 s dan qisqa dum — bu pauzaning quyrug'i, tanishga hojat yo'q.
+            if tail.count >= Int(0.35 * 16000) {
+                submit(tail, threads: Whisper.threads, qos: .userInitiated)
             }
         }
-        // oxirgi to'liq bo'lmagan oyna
-        let tail = rms.count * win
-        if tail < s.count { out.append(contentsOf: s[tail...]) }
-        return out
+        let submitted = parts.count
+        // Navbat ketma-ket: bu blok undan oldingi barcha bo'laklardan keyin ishlaydi.
+        Whisper.shared.barrier { [weak self] in
+            guard let self = self, gen == self.generation else { return }
+            NSLog("[rubai] oqim: \(submitted) bo'lak, dum \(String(format: "%.1f", tailSec))s")
+            done(self.joined(), submitted)
+        }
     }
 
-    // Yozuvdagi eng baland joy — "umuman jim edi" holatini aniqlash uchun
-    static func peakLevel(_ s: [Float]) -> Float {
-        guard !s.isEmpty else { return 0 }
-        return envelope(s).max() ?? 0
+    // MARK: ichki
+
+    private func startTimer() {
+        stopTimer()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 0.7, repeating: 0.7, leeway: .milliseconds(200))
+        t.setEventHandler { [weak self] in self?.pump() }
+        t.resume()
+        timer = t
     }
 
-    // whisper 1 soniyadan qisqa audioni qabul qilmaydi — nol bilan to'ldiramiz.
-    static func padIfShort(_ s: [Float]) -> [Float] {
-        let minLen = Int(1.1 * 16000)
-        if s.count >= minLen { return s }
-        return s + [Float](repeating: 0, count: minLen - s.count)
+    private func stopTimer() {
+        timer?.cancel()
+        timer = nil
+    }
+
+    private func pump() {
+        guard !scanning, rec.isRecording else { return }
+        let total = rec.sampleCount
+        guard total - cursor >= Audio.minChunk else { return }
+
+        let from = cursor
+        let gen = generation
+        let tail = rec.slice(from: from, to: total)
+        scanning = true
+        DispatchQueue.global(qos: .utility).async {
+            let cut = Audio.cut(tail)
+            DispatchQueue.main.async {
+                self.scanning = false
+                // Skanerlash paytida til almashgan/bekor qilingan bo'lishi mumkin.
+                guard gen == self.generation, self.cursor == from, let cut = cut else { return }
+                NSLog("[rubai] kesish: \(String(format: "%.1f", Double(cut.at) / 16000.0))s — \(cut.why.rawValue), pauza \(String(format: "%.1f", cut.pause))s, rms=\(String(format: "%.4f", cut.level))")
+                self.cursor = from + cut.at
+                self.submit(Array(tail[0..<cut.at]), threads: Whisper.backgroundThreads, qos: .utility)
+            }
+        }
+    }
+
+    private func submit(_ raw: [Float], threads: Int32, qos: DispatchQoS) {
+        let idx = parts.count
+        parts.append("")
+        chunkNo += 1
+        let no = chunkNo
+        let gen = generation
+
+        // Jim bo'lak whisper'ga umuman berilmaydi: jimlikda u «[музыка]»,
+        // «*звук птиц*» o'ylab topadi (shu sabab butun yozuv uchun ham tekshiramiz).
+        let peak = Audio.peakLevel(raw)
+        guard peak >= 0.012 else {
+            NSLog("[rubai] bo'lak #\(no): jim (peak=\(String(format: "%.4f", peak))) — o'tkazildi")
+            return
+        }
+
+        let audio = Audio.prepare(raw)
+        Whisper.shared.transcribe(audio, threads: threads, qos: qos, tag: " #\(no)") { [weak self] text in
+            NSLog("[rubai] bo'lak #\(no) matni: '\(text)'")
+            guard let self = self, gen == self.generation, idx < self.parts.count else { return }
+            self.parts[idx] = text
+        }
+    }
+
+    private func joined() -> String {
+        parts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+             .filter { !$0.isEmpty }
+             .joined(separator: " ")
     }
 }
 
@@ -1457,12 +1555,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var langItemRU: NSMenuItem!
     private var langItemUZ: NSMenuItem!
     private var accurateItem: NSMenuItem!
+    private var streamItem: NSMenuItem!
+    private lazy var stream = StreamTranscriber(rec)
 
     // «Aniqroq rejim» — beam search. Sozlama saqlanadi.
     private var accurate: Bool {
         get { UserDefaults.standard.bool(forKey: "accurateMode") }
         set { UserDefaults.standard.set(newValue, forKey: "accurateMode") }
     }
+
+    // «Gapirganda tanish» — bo'laklar yozish davomida tanilади (standart: yoqilgan).
+    // O'chirilsa — eski yo'l: hamma narsa ⌘ dan keyin bir marta tanilади.
+    private var streaming: Bool {
+        get { UserDefaults.standard.object(forKey: "streamingMode") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "streamingMode") }
+    }
+
+    // Shu diktovka oqimli ketyaptimi. Yozish o'rtasida menyudan almashtirilsa
+    // ham joriy diktovka boshlangan rejimda tugashi kerak.
+    private var streamingNow = false
 
     // Joriy diktovka tili va u qaysi tap-seriyasida boshlanganini eslab qolamiz
     private var lang = "ru"
@@ -1501,6 +1612,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         accurateItem = NSMenuItem(title: "Aniqroq rejim (sekinroq)", action: #selector(toggleAccuracy), keyEquivalent: "")
         accurateItem.state = accurate ? .on : .off
         menu.addItem(accurateItem)
+        streamItem = NSMenuItem(title: "Gapirganda tanish (tezroq)", action: #selector(toggleStreaming), keyEquivalent: "")
+        streamItem.state = streaming ? .on : .off
+        menu.addItem(streamItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Sozlamalar…", action: #selector(openSettings), keyEquivalent: ","))
         loginItem = NSMenuItem(title: "Login'da ishga tushirish", action: #selector(toggleLogin), keyEquivalent: "")
@@ -1577,6 +1691,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Whisper.shared.setLanguage(l)
         overlay.setLanguage(l)
         refreshLangMenu()
+        // Yozish ustida til almashsa, allaqachon tanilgan bo'laklar eski tilda —
+        // ularni tashlab, yozuvni boshidan qayta tanishga qo'yamiz.
+        if rec.isRecording && streamingNow { stream.restart() }
         NSLog("[rubai] til -> \(l)")
     }
 
@@ -1589,6 +1706,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             NSLog("[rubai] record start ok=\(ok) lang=\(l)")
             if ok {
+                self.streamingNow = self.streaming
+                if self.streamingNow { self.stream.begin() }
                 self.overlay.showRecording(lang: l)
             } else {
                 self.overlay.flash("Mikrofonga ruxsat yo'q", seconds: 2.0)
@@ -1600,29 +1719,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard rec.isRecording else { return }
         startedByTapSeries = false
         taps.resetSeries()
+        let t0 = Date()
         let raw = rec.stop()
 
         // Jim yozuvda whisper "*qush sayrashi*", "(musiqa)" kabi narsalarni
         // o'ylab topadi va ular matn maydoniga tushib qoladi. Shuning uchun
         // umuman ovoz bo'lmasa — umuman tanimaymiz.
-        let peak = Recorder.peakLevel(raw)
+        let peak = Audio.peakLevel(raw)
         if peak < 0.012 {
             NSLog("[rubai] jim yozuv (peak=\(String(format: "%.4f", peak))) — tanilmadi")
+            if streamingNow { stream.abort(); streamingNow = false }
             overlay.flash("Ovoz eshitilmadi", seconds: 1.4)
             return
         }
 
-        let trimmed = Recorder.padIfShort(Recorder.compressPauses(Recorder.trimSilence(raw)))
-        NSLog("[rubai] stopped: \(String(format: "%.1f", Double(raw.count)/16000.0))s -> \(String(format: "%.1f", Double(trimmed.count)/16000.0))s (jimlik kesildi)")
+        let rawSec = String(format: "%.1f", Double(raw.count) / 16000.0)
         overlay.showProcessing()
+
+        // Oqimli yo'l: yozish davomida bo'laklar allaqachon tanilgan, endi
+        // faqat dum qoladi — kutish diktovka uzunligiga bog'liq emas.
+        if streamingNow {
+            streamingNow = false
+            NSLog("[rubai] stopped: \(rawSec)s (oqimli)")
+            stream.finish(all: raw) { [weak self] text, chunks in
+                NSLog("[rubai] kutish: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s (\(chunks) bo'lak)")
+                self?.deliver(text)
+            }
+            return
+        }
+
+        // Eski yo'l — hammasi bir marta, ⌘ dan keyin.
+        let trimmed = Audio.prepare(raw)
+        NSLog("[rubai] stopped: \(rawSec)s -> \(String(format: "%.1f", Double(trimmed.count)/16000.0))s (jimlik kesildi)")
         Whisper.shared.transcribe(trimmed) { [weak self] text in
-            NSLog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
-            self?.overlay.hide()
-            Inserter.insert(AppDelegate.collapseRepeats(AppDelegate.dropHallucination(text)))
+            NSLog("[rubai] kutish: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+            self?.deliver(text)
         } fail: { [weak self] msg in
             NSLog("[rubai] transcription XATO: \(msg)")
             self?.overlay.flash("⚠️ \(msg)")
         }
+    }
+
+    // Tanilgan matnni tozalab, faol maydonga qo'yish. Ikkala yo'l uchun bitta joy.
+    private func deliver(_ text: String) {
+        NSLog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
+        overlay.hide()
+        Inserter.insert(AppDelegate.collapseRepeats(AppDelegate.dropHallucination(text)))
     }
 
     // Whisper jimlikda "sahna izohi" o'ylab topadi: «[музыка]», «*звук птиц*»,
@@ -1722,6 +1864,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startedByTapSeries = false
         taps.resetSeries()
         _ = rec.stop()
+        // Avlod ortadi: yo'lda qolgan bo'laklarning javoblari keyingi diktovkaga
+        // aralashib ketmaydi.
+        if streamingNow { stream.abort(); streamingNow = false }
         overlay.hide()
         NSLog("[rubai] bekor qilindi")
     }
@@ -1763,6 +1908,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.flash(accurate ? "Aniqroq rejim" : "Tez rejim", seconds: 1.2)
     }
 
+    @objc private func toggleStreaming() {
+        streaming.toggle()
+        streamItem.state = streaming ? .on : .off
+        NSLog("[rubai] gapirganda tanish: \(streaming)")
+        overlay.flash(streaming ? "Gapirganda tanish" : "Oxirida tanish", seconds: 1.2)
+    }
+
     @objc private func toggleLogin() {
         LoginItem.set(!LoginItem.isEnabled)
         loginItem.state = LoginItem.isEnabled ? .on : .off
@@ -1801,7 +1953,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ n: Notification) { rubai_unload() }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+// Kirish nuqtasi. Endi bir nechta fayl kompilyatsiya qilinadi (audio.swift ham),
+// shuning uchun "top-level" kod o'rniga @main — Swift boshqacha ruxsat bermaydi.
+@main
+struct RubaiSTTApp {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}

@@ -43,7 +43,7 @@ for ARCH in "${ARCHS[@]}"; do
     echo "  -> $ARCH"
     $NICE clang -c "$SRC/whisper_bridge.c" -arch "$ARCH" -O2 \
         -I"$WC/include" -I"$WC/ggml/include" -o "$SRC/whisper_bridge.$ARCH.o"
-    $NICE swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/whisper_bridge.$ARCH.o" \
+    $NICE swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/whisper_bridge.$ARCH.o" \
         -import-objc-header "$SRC/Bridging.h" \
         "$LIB/src/libwhisper.a" \
         "$LIB/ggml/src/libggml.a" \
