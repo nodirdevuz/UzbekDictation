@@ -5,6 +5,60 @@
 а не рассуждением. Прочитай целиком перед первой правкой: половина пунктов — это грабли,
 на которые уже наступали.
 
+## 🔴 Состояние на 25.09.2026 — переезд на Apple Silicon, только русский
+
+Владелец переехал на **MacBook Air M5** (4P+6E ядер, 16 ГБ, macOS 26). Всё, что ниже про
+Intel/i9 и «Metal в 24 раза медленнее», относится к старой машине и для arm64 **не действует**.
+
+- **Только русский.** Узбекский, ⌘⌘⌘ и выбор языка удалены (владелец: «буду общаться только
+  на русском»). Интерфейс переведён на русский.
+- **Управление:** **⌘⌘** (двойной тап левой **или** правой) — старт; **⌘** — стоп и вставка.
+  ⎋ — отмена. ⌃⌥D — запас. Одиночный тап сначала пробовали для старта — владелец вернул
+  двойной: «случайные нажатия тоже бывают». Лишний третий тап серии (⌘⌘⌘) запись не
+  останавливает — первые 0,45 с после старта тапы игнорируются.
+- **Модель:** `ggml-large-v3-turbo-q5_0.bin` (574 МБ, `Whisper.modelFile`), Metal +
+  flash_attn. q5_0 вместо q8_0: на замере точность одинаковая, а памяти и нагрева меньше —
+  это Air без вентилятора. Замер: 16 с речи → ~1 с; живой тест через динамик — 13 с речи, ожидание после
+  ⌘ **0,70 с**. Точнее small заметно (грабли 8 касались CPU на Intel).
+- **audio_ctx на arm64 всегда полный.** turbo с урезанным контекстом зацикливается:
+  фраза 3 с при `audio_ctx=200` вышла 6 раз подряд. Полный на Metal стоит ~0,5 с.
+- **Простой = ноль нагрузки.** Модель НЕ грузится при запуске: `Whisper.preload()` зовётся
+  в момент старта записи (грузится, пока человек говорит), а через 120 с после конца
+  диктовки `scheduleUnload()` выгружает её. В простое: 0 % CPU, ~60 МБ RAM.
+- **Первая загрузка после новой сборки ~13 с** — macOS компилирует Metal-шейдеры для нового
+  бинарника; дальше кэш, загрузка ~0,2–0,4 с.
+- **Логи:** на macOS 26 `NSLog` виден только как `<private>`, поэтому всё идёт через
+  `rlog()` (os_log `%{public}`). Читать:
+  `/usr/bin/log show --last 10m --predicate 'subsystem == "com.rubaistt.dictation"' --style compact`
+- **Автозавершение запрещено** (`disableAutomaticTermination`): у меню-бар приложения без
+  окон macOS 26 ставит `WouldBeTerminatedByTAL=1`.
+- **Сборка:** Command Line Tools здесь «наполовину обновлены» — SDK 27 не понимается
+  компилятором Swift 6.3. `build.sh` сам подбирает рабочий SDK (сейчас 26.5). whisper.cpp
+  собирать с `-DCMAKE_OSX_SYSROOT=<тот же SDK> -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
+  -DGGML_BLAS=ON -DBUILD_SHARED_LIBS=OFF` в `whisper.cpp/build-static`.
+- **Сертификат подписи** обязан иметь `keyUsage=critical,digitalSignature`, иначе codesign
+  пишет «no identity found» (рецепт ниже без этого флага — на macOS 26 не работает), и
+  его нужно пометить доверенным: `security add-trusted-cert -r trustRoot -p codeSign -k
+  ~/Library/Keychains/login.keychain-db c.pem` (спросит пароль владельца).
+- **Английские термины** (Supabase, Railway, Vercel, Web App…) whisper в русской речи пишет
+  на слух: «Ворсил», «супы байс», «веб-эп». Лечится словарём `src/terms.swift` (`Terms.fix`,
+  применяется последним в `deliver`). Тест: `swiftc -O -parse-as-library
+  tools/test-terms.swift src/terms.swift -o /tmp/termtest && /tmp/termtest` — там же
+  проверки, что обычные слова («суп», «версия», «вид») не трогаются. Новое искажение из лога →
+  правило в terms.swift + строка в тесте.
+- **Текст никогда не теряется.** Результат всегда остаётся в буфере (прежний буфер больше
+  не восстанавливается). Если поля ввода точно нет (`Inserter.hasTextTarget`: Finder/рабочий
+  стол = `AXGroup`, списки, кнопки, «ничего не в фокусе»), ⌘V не шлётся — капсула пишет
+  «Скопировано · ⌘V». AXGroup/AXWebArea в других приложениях считаются «возможно поле»
+  (так выглядят Electron/веб) — туда вставляем. Системный `AXFocusedUIElement` на macOS 26
+  даёт -25204, поэтому фокус спрашивается у активного приложения.
+- **Капсула:** надпись RU убрана, 15 столбиков по 2,2 pt (было 19 × 1,6 — владелец: «мелкие,
+  сделай чуть больше»), высота до ~22 pt с огибающей (в центре выше);
+  уровень от −46 дБ — фон комнаты больше не поднимает столбики, в тишине ровный ряд точек.
+  Капсулу можно отрисовать в PNG без скриншота (скриншот требует разрешения «Запись экрана»):
+  вырезать `CapsuleView` из dictate.swift и нарисовать в `NSBitmapImageRep`.
+- Модель лежит в `~/rubai-stt/models/`, `install.sh` сам кладёт её в `/Applications/…/Resources`.
+
 ## Что это
 
 Системная диктовка речь→текст для macOS. Работает **офлайн** через whisper.cpp.
@@ -31,7 +85,8 @@
 `ggml-multilingual.bin` — русский, Whisper small q8_0, 252 МБ. Обе грузятся в RAM при
 старте и **не выгружаются**.
 
-Комментарии, логи и текст в интерфейсе — **на узбекском**. Пиши так же.
+Старые комментарии и логи — на узбекском; новый код (с 25.09.2026) комментируется
+по-русски, текст интерфейса — **на русском**.
 
 ## Сборка и установка
 
@@ -64,7 +119,8 @@ Accessibility: речь распознаётся, но текст не вста�
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 3650 -nodes \
-  -subj "/CN=RubaiSTT Local Signing" -addext "extendedKeyUsage=codeSigning" \
+  -subj "/CN=RubaiSTT Local Signing" -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=critical,codeSigning" \
   -addext "basicConstraints=critical,CA:false"
 openssl pkcs12 -export -inkey k.pem -in c.pem -out c.p12 -passout pass:rubai \
   -name "RubaiSTT Local Signing" -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
@@ -297,9 +353,8 @@ ffmpeg -f avfoundation -i ":2" -t 3 -af volumedetect -f null -
 
 ```bash
 swiftc -O tools/simulate-taps.swift -o /tmp/taps
-/tmp/taps tap2   # ⌘⌘ — старт (русский)
-/tmp/taps tap3   # ⌘⌘⌘ — старт (узбекский)
-/tmp/taps tap1   # ⌘ — стоп
+/tmp/taps tap1   # левый ⌘ — старт / стоп
+/tmp/taps rtap1  # правый ⌘ — то же
 /tmp/taps cmdc   # ⌘C дважды — запись НЕ должна начаться
 /tmp/taps hold   # удержание ⌘ — тоже не должна
 ```

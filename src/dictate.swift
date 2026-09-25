@@ -6,6 +6,12 @@ import AppKit
 import Carbon.HIToolbox
 import ApplicationServices
 import ServiceManagement
+import os
+
+// На macOS 26 NSLog прячет текст сообщения в системном журнале («<private>»),
+// и без sudo его не прочитать. os_log с %{public} виден всегда.
+private let rubaiLog = OSLog(subsystem: "com.rubaistt.dictation", category: "app")
+func rlog(_ s: String) { os_log("%{public}@", log: rubaiLog, type: .default, s) }
 
 // MARK: - Whisper (rubaiSTT) yadrosi
 
@@ -14,11 +20,23 @@ final class Whisper {
     private var loaded = false
     private let q = DispatchQueue(label: "rubai.whisper")
 
-    // Fizik yadrolar soni (i9-9880H = 8). Hyper-threading yadrolarini qo'shish
-    // whisper matmul'ini sekinlashtiradi, shuning uchun mantiqiy emas, fizik.
+    // Файл модели. large-v3-turbo на Metal: заметно точнее small в русском.
+    // q5_0, а не q8_0: точность на замере одинаковая, а модель на 300 МБ меньше —
+    // меньше памяти и нагрева на MacBook Air без вентилятора.
+    static let modelFile = "ggml-large-v3-turbo-q5_0"
+
+    // Сколько модель живёт в памяти после последней диктовки. Потом выгружается —
+    // в простое приложение не держит ~1 ГБ и ничего не считает.
+    static let idleUnload: TimeInterval = 120
+    private var unloadWork: DispatchWorkItem?
+
+    // Потоки CPU: только производительные ядра (на M5 их 4). Основную работу
+    // делает GPU, а энергоэффективные ядра в матрицах только тормозят.
     static let threads: Int32 = {
         var n: Int32 = 0
         var size = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.perflevel0.physicalcpu", &n, &size, nil, 0) == 0, n > 0 { return n }
+        size = MemoryLayout<Int32>.size
         if sysctlbyname("hw.physicalcpu", &n, &size, nil, 0) == 0, n > 0 { return n }
         return Int32(max(4, ProcessInfo.processInfo.activeProcessorCount / 2))
     }()
@@ -28,34 +46,52 @@ final class Whisper {
     // nusxada turadi. Shuning uchun barcha ma'lum joylarni ketma-ket tekshiramiz —
     // qaysi nusxa ishga tushsa ham diktovka ishlayveradi.
     private func modelPath() -> String? {
+        let f = Whisper.modelFile + ".bin"
         var candidates: [String] = []
-        if let p = Bundle.main.path(forResource: "ggml-rubaistt", ofType: "bin") { candidates.append(p) }
+        if let p = Bundle.main.path(forResource: Whisper.modelFile, ofType: "bin") { candidates.append(p) }
         candidates += [
-            "/Applications/RubaiSTT Dictation.app/Contents/Resources/ggml-rubaistt.bin",
-            NSHomeDirectory() + "/Applications/RubaiSTT Dictation.app/Contents/Resources/ggml-rubaistt.bin",
-            NSHomeDirectory() + "/rubai-stt/models/ggml-rubaistt.bin",
+            "/Applications/RubaiSTT Dictation.app/Contents/Resources/" + f,
+            NSHomeDirectory() + "/Applications/RubaiSTT Dictation.app/Contents/Resources/" + f,
+            NSHomeDirectory() + "/rubai-stt/models/" + f,
         ]
         for p in candidates where FileManager.default.fileExists(atPath: p) {
-            if p != candidates.first { NSLog("[rubai] model boshqa joydan olindi: \(p)") }
+            if p != candidates.first { rlog("[rubai] model boshqa joydan olindi: \(p)") }
             return p
         }
         return nil
     }
 
-    // Ilova ishga tushganda fonda chaqiriladi — birinchi diktovkadagi
-    // ~1.3 s model yuklash kutishini yo'q qiladi.
-    func preload(lang: String) {
-        q.async {
+    // Вызывается в момент старта записи: модель грузится, пока человек говорит,
+    // поэтому в ожидание после ⌘ загрузка не попадает.
+    func preload() {
+        DispatchQueue.main.async { self.unloadWork?.cancel(); self.unloadWork = nil }
+        q.async(qos: .userInitiated) {
             guard !self.loaded, let mp = self.modelPath() else { return }
             let t0 = Date()
-            if rubai_preload(mp, lang) == 0 {
+            if rubai_load(mp) == 0 {
                 self.loaded = true
-                NSLog("[rubai] model oldindan yuklandi (\(lang)) \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+                rlog("[rubai] model yuklandi \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
             }
         }
     }
 
-    func setLanguage(_ lang: String) { rubai_set_language(lang) }
+    // Диктовка закончилась — через idleUnload секунд простоя выгружаем модель.
+    // Выгрузка встаёт в ту же очередь, поэтому не может случиться посреди распознавания.
+    func scheduleUnload() {
+        unloadWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.unloadWork = nil
+            self.q.async {
+                guard self.loaded else { return }
+                rubai_unload()
+                self.loaded = false
+                rlog("[rubai] model xotiradan chiqarildi (bo'sh turibdi)")
+            }
+        }
+        unloadWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + Whisper.idleUnload, execute: w)
+    }
 
     // Fon bo'laklari uchun yadrolarning yarmi: odam shu payt gapiryapti va
     // shu mashinada ishlayapti ham — 8 yadroni to'liq band qilish sezilib qoladi.
@@ -77,13 +113,13 @@ final class Whisper {
         q.async(qos: qos) {
             if !self.loaded {
                 guard let mp = self.modelPath() else {
-                    NSLog("[rubai] XATO: model fayli topilmadi (bundle/uy)")
-                    DispatchQueue.main.async { fail("Model fayli topilmadi") }; return
+                    rlog("[rubai] XATO: model fayli topilmadi (bundle/uy)")
+                    DispatchQueue.main.async { fail("Файл модели не найден") }; return
                 }
                 let rc = rubai_load(mp)
-                NSLog("[rubai] rubai_load(\(mp)) = \(rc)")
+                rlog("[rubai] rubai_load(\(mp)) = \(rc)")
                 guard rc == 0 else {
-                    DispatchQueue.main.async { fail("Model yuklanmadi (kod \(rc))") }; return
+                    DispatchQueue.main.async { fail("Модель не загрузилась (код \(rc))") }; return
                 }
                 self.loaded = true
             }
@@ -97,7 +133,7 @@ final class Whisper {
                     rubai_free_str(c)
                 }
             }
-            NSLog("[rubai] transcribe\(tag): \(String(format: "%.2f", Date().timeIntervalSince(t0)))s / audio \(String(format: "%.1f", Double(samples.count) / 16000.0))s")
+            rlog("[rubai] transcribe\(tag): \(String(format: "%.2f", Date().timeIntervalSince(t0)))s / audio \(String(format: "%.1f", Double(samples.count) / 16000.0))s")
             DispatchQueue.main.async { done(text) }
         }
     }
@@ -108,8 +144,6 @@ final class Whisper {
         q.async(qos: qos) { DispatchQueue.main.async(execute: done) }
     }
 
-    func unload() { q.async { if self.loaded { rubai_unload(); self.loaded = false } } }
-    var isLoaded: Bool { loaded }
 }
 
 // MARK: - Kirish qurilmalari (qaysi mikrofondan yozamiz)
@@ -219,7 +253,7 @@ enum InputDevice {
         let cur = systemInput
         guard isBluetooth(cur), let mac = builtIn(), mac != cur else { return false }
         systemInput = mac
-        NSLog("[rubai] tizim kirishi \(name(cur)) (bluetooth) dan \(name(mac)) ga qaytarildi")
+        rlog("[rubai] tizim kirishi \(name(cur)) (bluetooth) dan \(name(mac)) ga qaytarildi")
         return true
     }
 
@@ -335,7 +369,7 @@ final class Recorder {
         var hw = input.inputFormat(forBus: 0)
         if hw.sampleRate <= 0 { hw = input.outputFormat(forBus: 0) }
         guard hw.sampleRate > 0 else { return false }
-        NSLog("[rubai] mikrofon: \(deviceName) — \(Int(hw.sampleRate)) Hz, \(hw.channelCount) kanal")
+        rlog("[rubai] mikrofon: \(deviceName) — \(Int(hw.sampleRate)) Hz, \(hw.channelCount) kanal")
         converter = AVAudioConverter(from: hw, to: target)
         convFrom = hw
         input.installTap(onBus: 0, bufferSize: 4096, format: hw) { [weak self] buf, _ in
@@ -345,7 +379,7 @@ final class Recorder {
             if self.convFrom == nil || !self.convFrom!.isEqual(buf.format) {
                 self.converter = AVAudioConverter(from: buf.format, to: self.target)
                 self.convFrom = buf.format
-                NSLog("[rubai] kirish formati o'zgardi -> \(Int(buf.format.sampleRate)) Hz")
+                rlog("[rubai] kirish formati o'zgardi -> \(Int(buf.format.sampleRate)) Hz")
             }
             guard let conv = self.converter else { return }
             let ratio = self.target.sampleRate / buf.format.sampleRate
@@ -368,7 +402,7 @@ final class Recorder {
                 }
                 self.lock.unlock()
                 if firstSound {
-                    NSLog("[rubai] birinchi ovoz: \(String(format: "%.2f", Date().timeIntervalSince(self.startedAt)))s")
+                    rlog("[rubai] birinchi ovoz: \(String(format: "%.2f", Date().timeIntervalSince(self.startedAt)))s")
                 }
 
                 // RMS -> daraja. Sekundiga ~30 marta yuboramiz (CPU'ni bekorga isitmaslik uchun).
@@ -377,12 +411,12 @@ final class Recorder {
                     var sum: Float = 0
                     for i in 0..<n { let v = ch[0][i]; sum += v * v }
                     let rms = sqrt(sum / Float(n))
-                    // Nutq oralig'i: -52 dB (jimlik) … -14 dB (baland gap).
-                    // Kvadrat ildiz — pastki qismini "ochadi": shivirlash ham ko'rinadi,
-                    // baland ovoz esa ustunni to'liq ko'taradi.
+                    // Речь: −46 дБ (тишина) … −14 дБ (громко). Раньше порог был −52 дБ
+                    // с корнем — фоновый шум комнаты поднимал все столбики до половины
+                    // (скриншот владельца 25.09.2026). Теперь тишина — ровная линия.
                     let db = 20 * log10(max(rms, 1e-6))
-                    let norm = max(0, min(1, (db + 52) / 38))
-                    let lvl = sqrt(norm)
+                    let norm = max(0, min(1, (db + 46) / 30))
+                    let lvl = pow(norm, 0.9)
                     DispatchQueue.main.async { self.onLevel?(lvl) }
                 }
             }
@@ -403,7 +437,7 @@ final class Recorder {
         engine.stop()
         isRecording = false
         let ok = begin()
-        NSLog("[rubai] audio grafi qayta yig'ildi: \(ok ? "ok" : "muvaffaqiyatsiz")")
+        rlog("[rubai] audio grafi qayta yig'ildi: \(ok ? "ok" : "muvaffaqiyatsiz")")
         return ok
     }
 
@@ -471,15 +505,6 @@ final class StreamTranscriber {
         startTimer()
     }
 
-    // Til yozish ustida almashdi (⌘⌘⌘) — tanilganlar boshqa tilda, hammasini
-    // boshidan qayta tanish kerak.
-    func restart() {
-        generation += 1
-        cursor = 0
-        parts = []
-        NSLog("[rubai] oqim: til almashdi — bo'laklar bekor qilindi")
-    }
-
     func abort() {
         generation += 1
         cursor = 0
@@ -510,7 +535,7 @@ final class StreamTranscriber {
         // Navbat ketma-ket: bu blok undan oldingi barcha bo'laklardan keyin ishlaydi.
         Whisper.shared.barrier { [weak self] in
             guard let self = self, gen == self.generation else { return }
-            NSLog("[rubai] oqim: \(submitted) bo'lak, dum \(String(format: "%.1f", tailSec))s")
+            rlog("[rubai] oqim: \(submitted) bo'lak, dum \(String(format: "%.1f", tailSec))s")
             done(self.joined(), submitted)
         }
     }
@@ -546,7 +571,7 @@ final class StreamTranscriber {
                 self.scanning = false
                 // Skanerlash paytida til almashgan/bekor qilingan bo'lishi mumkin.
                 guard gen == self.generation, self.cursor == from, let cut = cut else { return }
-                NSLog("[rubai] kesish: \(String(format: "%.1f", Double(cut.at) / 16000.0))s — \(cut.why.rawValue), pauza \(String(format: "%.1f", cut.pause))s, rms=\(String(format: "%.4f", cut.level))")
+                rlog("[rubai] kesish: \(String(format: "%.1f", Double(cut.at) / 16000.0))s — \(cut.why.rawValue), pauza \(String(format: "%.1f", cut.pause))s, rms=\(String(format: "%.4f", cut.level))")
                 self.cursor = from + cut.at
                 // Fon bo'lagi: odam hali gapiryapti, ya'ni vaqt baribir bo'sh
                 // turardi — shuning uchun ANIQ rejim va to'liq audio_ctx.
@@ -576,7 +601,7 @@ final class StreamTranscriber {
         // «*звук птиц*» o'ylab topadi (shu sabab butun yozuv uchun ham tekshiramiz).
         let peak = Audio.peakLevel(raw)
         guard peak >= 0.012 else {
-            NSLog("[rubai] bo'lak #\(no): jim (peak=\(String(format: "%.4f", peak))) — o'tkazildi")
+            rlog("[rubai] bo'lak #\(no): jim (peak=\(String(format: "%.4f", peak))) — o'tkazildi")
             return
         }
 
@@ -584,7 +609,7 @@ final class StreamTranscriber {
         Whisper.shared.transcribe(audio, threads: threads, qos: qos,
                                   accurate: accurate, fullCtx: fullCtx,
                                   prompt: prompt, tag: " #\(no)") { [weak self] text in
-            NSLog("[rubai] bo'lak #\(no) matni: '\(text)'")
+            rlog("[rubai] bo'lak #\(no) matni: '\(text)'")
             guard let self = self, gen == self.generation, idx < self.parts.count else { return }
             self.parts[idx] = text
         }
@@ -607,7 +632,7 @@ private final class CapsuleView: NSView {
     var messageText: String = ""
     // levels — ekrandagi (silliq), targets — mikrofondan kelgan nishon qiymatlar.
     // Bittasi ortiqcha: to'lqin uzluksiz surilishi uchun (phase bilan).
-    static let barCount = 11
+    static let barCount = 15
     var levels: [CGFloat] = Array(repeating: 0.02, count: barCount + 1)
     var targets: [CGFloat] = Array(repeating: 0.02, count: barCount + 1)
     var phase: CGFloat = 0                // 0…1 — qadamlar orasidagi uzluksiz siljish
@@ -618,7 +643,7 @@ private final class CapsuleView: NSView {
     var onAccept: (() -> Void)?
 
     private let sidePad: CGFloat = 0      // soya — oynaning o'zida
-    private let btnR: CGFloat = 9
+    private let btnR: CGFloat = 8
 
     private var capsuleRect: NSRect { bounds.insetBy(dx: sidePad, dy: sidePad) }
     private var leftBtnCenter: NSPoint {
@@ -666,20 +691,9 @@ private final class CapsuleView: NSView {
     private func drawRecording(_ r: NSRect) {
         drawCancelButton()
 
-        // Til bejagi: RU / UZ
-        let badge = lang == "ru" ? "RU" : "UZ"
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 8, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.42),
-            .kern: 0.5,
-        ]
-        let str = NSAttributedString(string: badge, attributes: attrs)
-        let badgeX = leftBtnCenter.x + btnR + 5
-        str.draw(at: NSPoint(x: badgeX, y: r.midY - str.size().height / 2 + 0.5))
-
-        // Ekvalayzer
-        let barsX0 = badgeX + str.size().width + 5
-        let barsX1 = rightBtnCenter.x - btnR - 5
+        // Эквалайзер — на всё место между кнопками (надпись RU убрана по просьбе владельца)
+        let barsX0 = leftBtnCenter.x + btnR + 9
+        let barsX1 = rightBtnCenter.x - btnR - 9
         drawBars(from: barsX0, to: barsX1, midY: r.midY)
 
         drawAcceptButton()
@@ -690,11 +704,9 @@ private final class CapsuleView: NSView {
     private func drawBars(from x0: CGFloat, to x1: CGFloat, midY: CGFloat) {
         let visible = CapsuleView.barCount
         guard levels.count > visible, x1 > x0 else { return }
-        let barW: CGFloat = 2.6
+        let barW: CGFloat = 2.2
         let step = (x1 - x0) / CGFloat(visible - 1)
-        let base = lang == "ru"
-            ? NSColor.white
-            : NSColor(calibratedRed: 0.40, green: 0.92, blue: 0.87, alpha: 1)
+        let base = NSColor.white
 
         for i in 0...visible {
             let x = x0 + (CGFloat(i) - phase) * step
@@ -704,9 +716,13 @@ private final class CapsuleView: NSView {
             if x < x0 + step      { edge = max(0, (x - (x0 - step)) / (step * 2)) }
             else if x > x1 - step { edge = max(0, ((x1 + step) - x) / (step * 2)) }
 
+            // Огибающая: в центре столбики выше, к краям плавно ниже — форма «волны»,
+            // а не забор одинаковых палочек.
+            let u = max(0, min(1, (x - x0) / (x1 - x0)))
+            let env = 0.35 + 0.65 * sin(u * .pi)
             // jim — ingichka chiziqcha, gapirganda — baland ustun (diktofondagidek)
-            let h = 2.6 + levels[min(i, levels.count - 1)] * 18
-            base.withAlphaComponent(0.9 * edge).setFill()
+            let h = 2.2 + levels[min(i, levels.count - 1)] * env * 20
+            base.withAlphaComponent((0.55 + 0.4 * env) * edge).setFill()
             let rect = NSRect(x: x - barW / 2, y: midY - h / 2, width: barW, height: h)
             NSBezierPath(roundedRect: rect, xRadius: barW / 2, yRadius: barW / 2).fill()
         }
@@ -834,7 +850,7 @@ final class Overlay {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self, p.isVisible else { return }
             if self.isOnScreen(p) {
-                if attempt > 0 { NSLog("[rubai] kapsula \(attempt)-chora bilan ko'rindi (spacesMode=\(self.spacesMode))") }
+                if attempt > 0 { rlog("[rubai] kapsula \(attempt)-chora bilan ko'rindi (spacesMode=\(self.spacesMode))") }
                 return
             }
             switch attempt {
@@ -850,7 +866,7 @@ final class Overlay {
                 p.orderFrontRegardless()
             default:
                 // Diktovkaning o'zi ishlayveradi — matn baribir qo'yiladi, faqat kapsula ko'rinmaydi.
-                NSLog("[rubai] kapsulani ko'rsatib bo'lmadi — diktovka ishlashda davom etadi")
+                rlog("[rubai] kapsulani ko'rsatib bo'lmadi — diktovka ishlashda davom etadi")
                 return
             }
             self.verifyVisible(p, attempt: attempt + 1)
@@ -1028,7 +1044,7 @@ final class Overlay {
         origin.x = min(max(origin.x, vis.minX + 8), vis.maxX - W - 8)
         origin.y = min(max(origin.y, vis.minY + 8), vis.maxY - H - 8)
         let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-        NSLog("[rubai] place app=\(app) ekran=\(Int(vis.minX)),\(Int(vis.minY)) \(Int(vis.width))x\(Int(vis.height)) → \(Int(origin.x)),\(Int(origin.y))")
+        rlog("[rubai] place app=\(app) ekran=\(Int(vis.minX)),\(Int(vis.minY)) \(Int(vis.width))x\(Int(vis.height)) → \(Int(origin.x)),\(Int(origin.y))")
         p.setFrameOrigin(origin)
     }
 
@@ -1044,11 +1060,6 @@ final class Overlay {
         appear(p)
         startAnimation()
         v.needsDisplay = true
-    }
-
-    func setLanguage(_ lang: String) {
-        view?.lang = lang
-        view?.needsDisplay = true
     }
 
     func showProcessing() {
@@ -1071,7 +1082,12 @@ final class Overlay {
             : currentLevel * 0.82 + v * 0.18      // so'nish — yumshoq
     }
 
+    // Номер показа: анимация скрытия завершается через 0,12 с и не должна убрать
+    // то, что показали после неё (например «Скопировано» сразу за результатом).
+    private var showGen = 0
+
     private func appear(_ p: NSPanel) {
+        showGen += 1
         applySpaces(p)   // Space'ga oid xatti-harakat ba'zan tiklanadi — har safar qayta qo'yamiz
         if !p.isVisible {
             p.alphaValue = 0
@@ -1081,8 +1097,13 @@ final class Overlay {
                 p.animator().alphaValue = 1
             }
         } else {
-            p.alphaValue = 1
+            // Через animator, а не присваиванием: иначе идущая анимация скрытия
+            // продолжит гасить окно до нуля поверх нового показа.
             p.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { c in
+                c.duration = 0.06
+                p.animator().alphaValue = 1
+            }
         }
         verifyVisible(p)   // ko'rsatdik deb ishonmaymiz — tekshiramiz
     }
@@ -1132,10 +1153,14 @@ final class Overlay {
     func hide() {
         timer?.invalidate(); timer = nil
         guard let p = panel, p.isVisible else { return }
+        let gen = showGen
         NSAnimationContext.runAnimationGroup({ c in
             c.duration = 0.12
             p.animator().alphaValue = 0
-        }, completionHandler: { [weak p] in p?.orderOut(nil) })
+        }, completionHandler: { [weak self, weak p] in
+            guard let self = self, self.showGen == gen else { return }
+            p?.orderOut(nil)
+        })
     }
 
     // Xato xabari — kapsula ichida qisqa matn
@@ -1146,8 +1171,12 @@ final class Overlay {
         v.messageText = text
         place(p); appear(p)
         v.needsDisplay = true
-        NSLog("[rubai] overlay: \(text)")
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in self?.hide() }
+        rlog("[rubai] overlay: \(text)")
+        let gen = showGen
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self = self, self.showGen == gen else { return }   // уже показано другое
+            self.hide()
+        }
     }
 }
 
@@ -1161,20 +1190,67 @@ enum Inserter {
     // Accessibility ruxsati yo'q bo'lsa chaqiriladi (matn buferda qoladi)
     static var onNoAccessibility: (() -> Void)?
 
+    // Курсора (поля ввода) нет — текст только скопирован, ⌘V не отправлялся
+    static var onCopiedOnly: (() -> Void)?
+
+    // Роли, в которых точно нет места для текста: список файлов, таблица, кнопка…
+    // AXGroup/AXWebArea сюда НЕ входят — так выглядят и Electron/веб-приложения
+    // с настоящим полем ввода; там безопаснее вставить (текст всё равно в буфере).
+    private static let nonTextRoles: Set<String> = [
+        "AXList", "AXOutline", "AXTable", "AXBrowser", "AXScrollArea", "AXButton",
+        "AXRow", "AXCell", "AXImage", "AXMenuBar", "AXMenuItem", "AXCheckBox",
+        "AXRadioButton", "AXSlider", "AXToolbar", "AXSplitGroup", "AXTabGroup",
+        "AXPopUpButton", "AXWindow", "AXApplication", "AXStaticText",
+    ]
+    private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+
+    // Есть ли куда вставлять. false — только когда УВЕРЕНЫ, что поля ввода нет.
+    // Системный AXFocusedUIElement на macOS 26 отвечает -25204 (замер 25.09.2026),
+    // поэтому спрашиваем у активного приложения.
+    static func hasTextTarget() -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return true }
+        let ae = AXUIElementCreateApplication(app.processIdentifier)
+        var f: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(ae, kAXFocusedUIElementAttribute as CFString, &f)
+        if err == .noValue { rlog("[rubai] fokus yo'q (\(app.localizedName ?? "?"))"); return false }
+        guard err == .success, let fr = f, CFGetTypeID(fr) == AXUIElementGetTypeID() else { return true }
+        let el = fr as! AXUIElement
+        var r: CFTypeRef?
+        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &r)
+        let role = (r as? String) ?? ""
+        if textRoles.contains(role) { return true }
+        var settable: DarwinBoolean = false
+        if AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success,
+           settable.boolValue { return true }
+        // Рабочий стол / окно Finder без поля переименования — AXGroup.
+        let finderDesk = app.bundleIdentifier == "com.apple.finder" && role == "AXGroup"
+        let none = nonTextRoles.contains(role) || finderDesk
+        rlog("[rubai] fokus: \(app.localizedName ?? "?") role=\(role) → \(none ? "maydon yo'q" : "qo'yamiz")")
+        return !none
+    }
+
     static func insert(_ text: String) {
         let trusted = AXIsProcessTrusted()
-        NSLog("[rubai] insert: len=\(text.count) AXTrusted=\(trusted)")
-        guard !text.isEmpty else { NSLog("[rubai] insert: matn bo'sh, to'xtatildi"); return }
+        rlog("[rubai] insert: len=\(text.count) AXTrusted=\(trusted)")
+        guard !text.isEmpty else { rlog("[rubai] insert: matn bo'sh, to'xtatildi"); return }
+        // Текст ВСЕГДА остаётся в буфере (раньше прежний буфер возвращался через 0,6 с,
+        // и если вставить было некуда — диктовка терялась). Владелец: «если курсора
+        // нигде нет — пусть просто скопируется, потом я вставлю».
         let pb = NSPasteboard.general
-        let old = pb.string(forType: .string)
         pb.clearContents()
         pb.setString(text, forType: .string)
 
         // Ruxsat yo'q — sintetik ⌘V ishlamaydi. Eski buferni QAYTARMAYMIZ,
         // aks holda matn butunlay yo'qoladi: foydalanuvchi o'zi ⌘V bosa oladi.
         guard trusted else {
-            NSLog("[rubai] Accessibility yo'q — matn faqat buferga qo'yildi")
+            rlog("[rubai] Accessibility yo'q — matn faqat buferga qo'yildi")
             onNoAccessibility?()
+            return
+        }
+
+        guard hasTextTarget() else {
+            rlog("[rubai] maydon yo'q — faqat nusxalandi")
+            onCopiedOnly?()
             return
         }
 
@@ -1188,13 +1264,7 @@ enum Inserter {
         up?.flags = .maskCommand
         down?.post(tap: .cgAnnotatedSessionEventTap)
         up?.post(tap: .cgAnnotatedSessionEventTap)
-        NSLog("[rubai] ⌘V yuborildi (down=\(down != nil) up=\(up != nil))")
-        // eski clipboard'ni qaytarish
-        if let old = old {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                pb.clearContents(); pb.setString(old, forType: .string)
-            }
-        }
+        rlog("[rubai] ⌘V yuborildi (down=\(down != nil) up=\(up != nil))")
     }
 }
 
@@ -1261,7 +1331,7 @@ final class CommandTapDetector {
                                           NSWorkspace.screensDidWakeNotification,
                                           NSWorkspace.sessionDidBecomeActiveNotification] {
             nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                NSLog("[rubai] tizim uyg'ondi — tap tekshirilmoqda")
+                rlog("[rubai] tizim uyg'ondi — tap tekshirilmoqda")
                 self?.checkAlive()
             }
         }
@@ -1270,10 +1340,10 @@ final class CommandTapDetector {
     private func checkAlive() {
         guard let p = tapPort else { installTap(); return }
         if !CGEvent.tapIsEnabled(tap: p) {
-            NSLog("[rubai] tap o'chib qolgan — yoqilmoqda")
+            rlog("[rubai] tap o'chib qolgan — yoqilmoqda")
             CGEvent.tapEnable(tap: p, enable: true)
             if !CGEvent.tapIsEnabled(tap: p) {
-                NSLog("[rubai] yoqilmadi — qaytadan yaratamiz")
+                rlog("[rubai] yoqilmadi — qaytadan yaratamiz")
                 teardownTap()
                 installTap()
             }
@@ -1300,9 +1370,9 @@ final class CommandTapDetector {
             tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
             CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
             CGEvent.tapEnable(tap: port, enable: true)
-            NSLog("[rubai] CGEventTap o'rnatildi (AXTrusted=\(AXIsProcessTrusted()))")
+            rlog("[rubai] CGEventTap o'rnatildi (AXTrusted=\(AXIsProcessTrusted()))")
         } else {
-            NSLog("[rubai] CGEventTap yaratilmadi — NSEvent monitorlari (zaxira)")
+            rlog("[rubai] CGEventTap yaratilmadi — NSEvent monitorlari (zaxira)")
             guard globalMon == nil else { return }   // takroriy o'rnatishdan saqlanamiz
             let m: NSEvent.EventTypeMask = [.flagsChanged, .keyDown,
                                             .leftMouseDown, .rightMouseDown, .otherMouseDown]
@@ -1319,7 +1389,7 @@ final class CommandTapDetector {
     fileprivate func reenable() {
         if let p = tapPort {
             CGEvent.tapEnable(tap: p, enable: true)
-            NSLog("[rubai] CGEventTap qayta yoqildi")
+            rlog("[rubai] CGEventTap qayta yoqildi")
         }
     }
 
@@ -1500,7 +1570,7 @@ final class HotKey {
         if !installed {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             let s1 = InstallEventHandler(GetApplicationEventTarget(), hotkeyHandler, 1, &spec, nil, nil)
-            NSLog("[rubai] hotkey handler o'rnatildi: \(s1) (0 = OK)")
+            rlog("[rubai] hotkey handler o'rnatildi: \(s1) (0 = OK)")
             installed = true
         }
         apply(HotKeyStore.load())
@@ -1512,7 +1582,7 @@ final class HotKey {
         let id = EventHotKeyID(signature: OSType(0x52535454), id: 1) // 'RSTT'
         let s = RegisterEventHotKey(c.keyCode, c.carbonModifiers, id,
                                     GetApplicationEventTarget(), 0, &ref)
-        NSLog("[rubai] hotkey ro'yxatdan o'tkazildi \(c.displayString): \(s) (0 = OK)")
+        rlog("[rubai] hotkey ro'yxatdan o'tkazildi \(c.displayString): \(s) (0 = OK)")
     }
 }
 
@@ -1543,23 +1613,23 @@ final class SettingsWindow {
     private func build() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 230),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "RubaiSTT — Sozlamalar"
+        w.title = "RubaiSTT — Настройки"
         w.isReleasedWhenClosed = false
         let v = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 230))
 
-        let main = NSTextField(labelWithString: "Asosiy usul: ⌘ tugmasi")
+        let main = NSTextField(labelWithString: "Основной способ: клавиша ⌘")
         main.font = .systemFont(ofSize: 14, weight: .semibold)
         main.frame = NSRect(x: 24, y: 188, width: 332, height: 20)
         v.addSubview(main)
 
         let mainHint = NSTextField(wrappingLabelWithString:
-            "⌘⌘ — ruscha yozishni boshlash\n⌘⌘⌘ — o'zbekcha yozishni boshlash\n⌘ — to'xtatish va matnni qo'yish  ·  ⎋ — bekor qilish")
+            "⌘⌘ (левая или правая) — начать запись\n⌘ — остановить и вставить текст\n⎋ — отмена")
         mainHint.font = .systemFont(ofSize: 11)
         mainHint.textColor = .secondaryLabelColor
         mainHint.frame = NSRect(x: 24, y: 128, width: 332, height: 56)
         v.addSubview(mainHint)
 
-        let title = NSTextField(labelWithString: "Zaxira tugma birikmasi")
+        let title = NSTextField(labelWithString: "Запасное сочетание клавиш")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         title.frame = NSRect(x: 24, y: 100, width: 332, height: 18)
         v.addSubview(title)
@@ -1570,13 +1640,13 @@ final class SettingsWindow {
         recordButton.frame = NSRect(x: 24, y: 60, width: 332, height: 34)
         v.addSubview(recordButton)
 
-        hintLabel = NSTextField(labelWithString: "Tugmani o'zgartirish uchun bosing.")
+        hintLabel = NSTextField(labelWithString: "Нажмите, чтобы изменить.")
         hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.textColor = .secondaryLabelColor
         hintLabel.frame = NSRect(x: 24, y: 42, width: 332, height: 16)
         v.addSubview(hintLabel)
 
-        let reset = NSButton(title: "Standartga qaytarish (⌃⌥D)", target: self, action: #selector(resetDefault))
+        let reset = NSButton(title: "Вернуть по умолчанию (⌃⌥D)", target: self, action: #selector(resetDefault))
         reset.bezelStyle = .rounded
         reset.frame = NSRect(x: 24, y: 12, width: 332, height: 26)
         v.addSubview(reset)
@@ -1586,10 +1656,10 @@ final class SettingsWindow {
     }
 
     private func refreshButton() {
-        recordButton.title = recording ? "Tugmani bosing…" : current.displayString
+        recordButton.title = recording ? "Нажмите сочетание…" : current.displayString
         hintLabel.stringValue = recording
-            ? "Kamida bitta modifier (⌃ ⌥ ⌘ ⇧) + tugma. Bekor qilish: ⎋"
-            : "Tugmani o'zgartirish uchun bosing."
+            ? "Модификатор (⌃ ⌥ ⌘ ⇧) + клавиша. Отмена: ⎋"
+            : "Нажмите, чтобы изменить."
     }
 
     @objc private func toggleRecord() {
@@ -1615,7 +1685,7 @@ final class SettingsWindow {
             let mods = carbonModifiers(from: event.modifierFlags)
             // Kamida bitta modifier shart (aks holda oddiy tugma global qotib qoladi)
             guard mods != 0 else {
-                self.hintLabel.stringValue = "Kamida bitta modifier (⌃ ⌥ ⌘ ⇧) kerak!"
+                self.hintLabel.stringValue = "Нужен хотя бы один модификатор (⌃ ⌥ ⌘ ⇧)!"
                 return nil
             }
             let cfg = HotKeyConfig(keyCode: UInt32(event.keyCode),
@@ -1650,7 +1720,7 @@ enum LoginItem {
             else  { try SMAppService.mainApp.unregister() }
             return true
         } catch {
-            NSLog("[rubai] login item xato: \(error.localizedDescription)")
+            rlog("[rubai] login item xato: \(error.localizedDescription)")
             return false
         }
     }
@@ -1681,7 +1751,7 @@ final class WelcomeWindow {
         let W: CGFloat = 460, H: CGFloat = 420
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "RubaiSTT Diktovka"
+        w.title = "RubaiSTT Диктовка"
         w.isReleasedWhenClosed = false
         let v = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
 
@@ -1691,14 +1761,14 @@ final class WelcomeWindow {
         iconView.imageScaling = .scaleProportionallyUpOrDown
         v.addSubview(iconView)
 
-        let title = NSTextField(labelWithString: "Xush kelibsiz!")
+        let title = NSTextField(labelWithString: "Добро пожаловать!")
         title.font = .systemFont(ofSize: 20, weight: .bold)
         title.alignment = .center
         title.frame = NSRect(x: 0, y: H - 130, width: W, height: 26)
         v.addSubview(title)
 
         let sub = NSTextField(wrappingLabelWithString:
-            "⌘ tugmasini 2 marta bosing → gapiring → 1 marta bosing, matn yoziladi.\n⌘ 3 marta — o'zbekcha. Zaxira birikma: \(hotkeyText)")
+            "Нажмите ⌘ дважды → говорите → нажмите ⌘ один раз, текст вставится.\nЗапасное сочетание: \(hotkeyText)")
         sub.font = .systemFont(ofSize: 12)
         sub.textColor = .secondaryLabelColor
         sub.alignment = .center
@@ -1707,23 +1777,23 @@ final class WelcomeWindow {
 
         // 1-qadam: Mikrofon
         micDot = stepRow(in: v, y: H - 220,
-                         title: "1. Mikrofon ruxsati",
-                         desc: "Ovozingizni eshitish uchun.",
-                         button: "Ruxsat so'rash", action: #selector(askMic))
+                         title: "1. Доступ к микрофону",
+                         desc: "Чтобы слышать ваш голос.",
+                         button: "Разрешить", action: #selector(askMic))
         // 2-qadam: Accessibility
         axDot = stepRow(in: v, y: H - 280,
-                        title: "2. Accessibility ruxsati",
-                        desc: "Tugmalarni eshitish va matn yozish uchun.",
-                        button: "Sozlamani ochish", action: #selector(openAX))
+                        title: "2. Универсальный доступ",
+                        desc: "Чтобы слышать ⌘ и вставлять текст.",
+                        button: "Открыть", action: #selector(openAX))
 
         // Login'da ishga tushirish
-        let loginCheck = NSButton(checkboxWithTitle: "Kompyuter yonganda avtomatik ishga tushsin",
+        let loginCheck = NSButton(checkboxWithTitle: "Запускать автоматически при включении",
                                   target: self, action: #selector(toggleLogin(_:)))
         loginCheck.state = LoginItem.isEnabled ? .on : .off
         loginCheck.frame = NSRect(x: 30, y: 70, width: W - 60, height: 20)
         v.addSubview(loginCheck)
 
-        let done = NSButton(title: "Boshladik!", target: self, action: #selector(closeWindow))
+        let done = NSButton(title: "Готово", target: self, action: #selector(closeWindow))
         done.bezelStyle = .rounded
         done.keyEquivalent = "\r"
         done.frame = NSRect(x: W - 150, y: 20, width: 120, height: 32)
@@ -1799,8 +1869,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hkConfig = HotKeyStore.load()
     private var dictateItem: NSMenuItem!
     private var loginItem: NSMenuItem!
-    private var langItemRU: NSMenuItem!
-    private var langItemUZ: NSMenuItem!
     private var accurateItem: NSMenuItem!
     private var streamItem: NSMenuItem!
     private lazy var stream = StreamTranscriber(rec)
@@ -1822,14 +1890,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // ham joriy diktovka boshlangan rejimda tugashi kerak.
     private var streamingNow = false
 
-    // Joriy diktovka tili va u qaysi tap-seriyasida boshlanganini eslab qolamiz
-    private var lang = "ru"
-    private var startedByTapSeries = false
-
-    private var defaultLang: String {
-        get { UserDefaults.standard.string(forKey: "lastLang") ?? "ru" }
-        set { UserDefaults.standard.set(newValue, forKey: "lastLang") }
-    }
 
     private lazy var settings: SettingsWindow = {
         let s = SettingsWindow(hkConfig)
@@ -1844,6 +1904,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar (Dock'da yo'q)
+        // У меню-бар приложения нет окон, и macOS считает его кандидатом на
+        // «автоматическое завершение» в простое (в журнале: WouldBeTerminatedByTAL=1).
+        // Диктовка обязана ждать ⌘ всегда — запрещаем.
+        ProcessInfo.processInfo.disableAutomaticTermination("diktovka ⌘ ni kutadi")
+        ProcessInfo.processInfo.disableSuddenTermination()
 
         // Bluetooth kolonka mikrofon bo'lib qolmasin — diktovka boshlanishini
         // kutmasdan, hozirdanoq. Kolonka HFP'dan chiqadi va musiqa ham tiniq
@@ -1854,34 +1919,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "rubaiSTT")
         let menu = NSMenu()
-        dictateItem = NSMenuItem(title: "Diktovka  (⌘⌘)", action: #selector(toggle), keyEquivalent: "")
+        dictateItem = NSMenuItem(title: "Диктовка  (⌘⌘)", action: #selector(toggle), keyEquivalent: "")
         menu.addItem(dictateItem)
         menu.addItem(.separator())
-        langItemRU = NSMenuItem(title: "Ruscha  (⌘⌘)", action: #selector(pickRU), keyEquivalent: "")
-        langItemUZ = NSMenuItem(title: "O'zbekcha  (⌘⌘⌘)", action: #selector(pickUZ), keyEquivalent: "")
-        menu.addItem(langItemRU)
-        menu.addItem(langItemUZ)
-        menu.addItem(.separator())
-        accurateItem = NSMenuItem(title: "Aniqroq rejim (sekinroq)", action: #selector(toggleAccuracy), keyEquivalent: "")
+        accurateItem = NSMenuItem(title: "Точный режим (медленнее)", action: #selector(toggleAccuracy), keyEquivalent: "")
         accurateItem.state = accurate ? .on : .off
         menu.addItem(accurateItem)
-        streamItem = NSMenuItem(title: "Gapirganda tanish (tezroq)", action: #selector(toggleStreaming), keyEquivalent: "")
+        streamItem = NSMenuItem(title: "Распознавать во время речи (быстрее)", action: #selector(toggleStreaming), keyEquivalent: "")
         streamItem.state = streaming ? .on : .off
         menu.addItem(streamItem)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Sozlamalar…", action: #selector(openSettings), keyEquivalent: ","))
-        loginItem = NSMenuItem(title: "Login'da ishga tushirish", action: #selector(toggleLogin), keyEquivalent: "")
+        menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ","))
+        loginItem = NSMenuItem(title: "Запускать при входе", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.state = LoginItem.isEnabled ? .on : .off
         menu.addItem(loginItem)
-        menu.addItem(NSMenuItem(title: "Accessibility ruxsatini ochish", action: #selector(openAX), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Yo'riqnoma…", action: #selector(openWelcome), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Открыть настройки Универсального доступа", action: #selector(openAX), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Инструкция…", action: #selector(openWelcome), keyEquivalent: ""))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Chiqish", action: #selector(quit), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Выйти", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
 
-        lang = defaultLang
-        refreshLangMenu()
-        Whisper.shared.setLanguage(lang)
         rubai_set_accuracy(accurate ? 1 : 0)
 
         // Zaxira birikma (⌃⌥D) — ishlashda qoladi
@@ -1894,16 +1951,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         taps.install()
         Inserter.willPaste = { [weak self] in self?.taps.mute(0.8) }
         Inserter.onNoAccessibility = { [weak self] in self?.warnNoAccessibility() }
+        Inserter.onCopiedOnly = { [weak self] in self?.overlay.flash("Скопировано · ⌘V", seconds: 2.2) }
 
         // Mikrofon darajasi -> ekvalayzer
         rec.onLevel = { [weak self] lvl in self?.overlay.push(level: lvl) }
         overlay.onCancel = { [weak self] in self?.cancel() }
         overlay.onAccept = { [weak self] in self?.stopAndTranscribe() }
 
-        // Modelni oldindan yuklaymiz (fon oqimida) — birinchi diktovka ham tez bo'lsin
-        DispatchQueue.global(qos: .utility).async { [lang] in
-            Whisper.shared.preload(lang: lang)
-        }
+        // Модель при запуске НЕ грузим: в простое приложение не должно занимать
+        // память и процессор. Она грузится на старте записи (см. start()).
 
         // Birinchi ishga tushish — onboarding oynasi; aks holda jim Accessibility tekshiruvi
         let d = UserDefaults.standard
@@ -1920,51 +1976,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: ⌘ tap mantiqi
 
-    // Yozish ketayotgan bo'lsa: 1 tap = to'xtatish. Lekin agar yozish shu
-    // seriyaning 2-tapida boshlangan bo'lsa, 3-tap tilni o'zbekchaga o'zgartiradi
-    // (yozish davom etaveradi — hech narsa yo'qolmaydi).
+    // ⌘⌘ (двойной тап левой или правой) — старт; одиночный ⌘ во время записи — стоп
+    // и вставка. Старт двойным — чтобы случайное нажатие ⌘ не включало запись.
+    private var recordStartedAt: TimeInterval = 0
+
     private func handleTap(_ n: Int) {
         if rec.isRecording {
-            if startedByTapSeries && n == 3 {
-                switchLanguage("uz")
-            } else {
-                stopAndTranscribe()
-            }
-            return
-        }
-        if n == 2 {
-            startedByTapSeries = true
-            start(lang: "ru")
+            // Лишний тап той же серии, что запустила запись (⌘⌘⌘), — не стоп.
+            if ProcessInfo.processInfo.systemUptime - recordStartedAt < 0.45 { return }
+            stopAndTranscribe()
+        } else if n == 2 {
+            start()
         }
     }
 
-    private func switchLanguage(_ l: String) {
-        lang = l
-        defaultLang = l
-        Whisper.shared.setLanguage(l)
-        overlay.setLanguage(l)
-        refreshLangMenu()
-        // Yozish ustida til almashsa, allaqachon tanilgan bo'laklar eski tilda —
-        // ularni tashlab, yozuvni boshidan qayta tanishga qo'yamiz.
-        if rec.isRecording && streamingNow { stream.restart() }
-        NSLog("[rubai] til -> \(l)")
-    }
-
-    private func start(lang l: String) {
-        lang = l
-        defaultLang = l
-        Whisper.shared.setLanguage(l)
-        refreshLangMenu()
+    private func start() {
+        recordStartedAt = ProcessInfo.processInfo.systemUptime
+        // Модель грузится параллельно с речью — к моменту ⌘ она уже готова.
+        Whisper.shared.preload()
         rec.start { [weak self] ok in
             guard let self = self else { return }
-            NSLog("[rubai] record start ok=\(ok) lang=\(l)")
+            rlog("[rubai] record start ok=\(ok)")
             if ok {
                 self.streamingNow = self.streaming
                 if self.streamingNow { self.stream.begin() }
-                self.overlay.showRecording(lang: l)
+                self.overlay.showRecording(lang: "ru")
                 self.watchSilentMic()
             } else {
-                self.overlay.flash("Mikrofonga ruxsat yo'q", seconds: 2.0)
+                self.overlay.flash("Нет доступа к микрофону", seconds: 2.0)
+                Whisper.shared.scheduleUnload()
             }
         }
     }
@@ -1990,18 +2030,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            NSLog("[rubai] mikrofon jim: \(self.rec.deviceName) — ovoz yo'q (bufer: \(self.rec.buffersSeen))")
+            rlog("[rubai] mikrofon jim: \(self.rec.deviceName) — ovoz yo'q (bufer: \(self.rec.buffersSeen))")
             _ = self.rec.stop()
             if self.streamingNow { self.stream.abort(); self.streamingNow = false }
-            self.startedByTapSeries = false
             self.taps.resetSeries()
-            self.overlay.flash("Mikrofon jim", seconds: 2.5)   // qurilma nomi logda
+            self.overlay.flash("Микрофон молчит", seconds: 2.5)   // qurilma nomi logda
+            Whisper.shared.scheduleUnload()
         }
     }
 
     private func stopAndTranscribe() {
         guard rec.isRecording else { return }
-        startedByTapSeries = false
         taps.resetSeries()
         let t0 = Date()
         let raw = rec.stop()
@@ -2011,9 +2050,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // umuman ovoz bo'lmasa — umuman tanimaymiz.
         let peak = Audio.peakLevel(raw)
         if peak < 0.012 {
-            NSLog("[rubai] jim yozuv (peak=\(String(format: "%.4f", peak))) — tanilmadi")
+            rlog("[rubai] jim yozuv (peak=\(String(format: "%.4f", peak))) — tanilmadi")
             if streamingNow { stream.abort(); streamingNow = false }
-            overlay.flash("Ovoz eshitilmadi", seconds: 1.4)
+            overlay.flash("Голос не слышно", seconds: 1.4)
+            Whisper.shared.scheduleUnload()
             return
         }
 
@@ -2024,9 +2064,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // faqat dum qoladi — kutish diktovka uzunligiga bog'liq emas.
         if streamingNow {
             streamingNow = false
-            NSLog("[rubai] stopped: \(rawSec)s (oqimli)")
+            rlog("[rubai] stopped: \(rawSec)s (oqimli)")
             stream.finish(all: raw) { [weak self] text, chunks in
-                NSLog("[rubai] kutish: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s (\(chunks) bo'lak)")
+                rlog("[rubai] kutish: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s (\(chunks) bo'lak)")
                 self?.deliver(text)
             }
             return
@@ -2034,21 +2074,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Eski yo'l — hammasi bir marta, ⌘ dan keyin.
         let trimmed = Audio.prepare(raw)
-        NSLog("[rubai] stopped: \(rawSec)s -> \(String(format: "%.1f", Double(trimmed.count)/16000.0))s (jimlik kesildi)")
+        rlog("[rubai] stopped: \(rawSec)s -> \(String(format: "%.1f", Double(trimmed.count)/16000.0))s (jimlik kesildi)")
         Whisper.shared.transcribe(trimmed) { [weak self] text in
-            NSLog("[rubai] kutish: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+            rlog("[rubai] kutish: \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
             self?.deliver(text)
         } fail: { [weak self] msg in
-            NSLog("[rubai] transcription XATO: \(msg)")
+            rlog("[rubai] transcription XATO: \(msg)")
             self?.overlay.flash("⚠️ \(msg)")
+            Whisper.shared.scheduleUnload()
         }
     }
 
     // Tanilgan matnni tozalab, faol maydonga qo'yish. Ikkala yo'l uchun bitta joy.
     private func deliver(_ text: String) {
-        NSLog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
+        rlog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
         overlay.hide()
-        Inserter.insert(AppDelegate.collapseRepeats(AppDelegate.dropHallucination(text)))
+        Inserter.insert(Terms.fix(AppDelegate.collapseRepeats(AppDelegate.dropHallucination(text))))
+        Whisper.shared.scheduleUnload()
     }
 
     // Whisper jimlikda "sahna izohi" o'ylab topadi: «[музыка]», «*звук птиц*»,
@@ -2075,7 +2117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             s = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
         }
         if s != t.trimmingCharacters(in: .whitespacesAndNewlines) {
-            NSLog("[rubai] sahna izohlari tozalandi: '\(t)' -> '\(s)'")
+            rlog("[rubai] sahna izohlari tozalandi: '\(t)' -> '\(s)'")
         }
         return s
     }
@@ -2118,7 +2160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let out = words.joined(separator: " ")
-        if out != text { NSLog("[rubai] takrorlar yig'ildi: \(text.count) -> \(out.count) belgi") }
+        if out != text { rlog("[rubai] takrorlar yig'ildi: \(text.count) -> \(out.count) belgi") }
         return out
     }
 
@@ -2145,28 +2187,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func cancel() {
         guard rec.isRecording else { return }
-        startedByTapSeries = false
         taps.resetSeries()
         _ = rec.stop()
         // Avlod ortadi: yo'lda qolgan bo'laklarning javoblari keyingi diktovkaga
         // aralashib ketmaydi.
         if streamingNow { stream.abort(); streamingNow = false }
         overlay.hide()
-        NSLog("[rubai] bekor qilindi")
+        Whisper.shared.scheduleUnload()
+        rlog("[rubai] bekor qilindi")
     }
 
     // Accessibility yo'q: matn buferda qoldi. Bir marta sozlamalarni taklif qilamiz.
     private var axWarned = false
     private func warnNoAccessibility() {
-        overlay.flash("Matn buferda — ⌘V bosing", seconds: 4)
+        overlay.flash("Текст в буфере — ⌘V", seconds: 4)
         guard !axWarned else { return }
         axWarned = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             let a = NSAlert()
-            a.messageText = "Accessibility ruxsati yo'q"
-            a.informativeText = "Shu sababli matn o'zi qo'yilmadi — u faqat buferga tushdi (⌘V bilan qo'ying).\n\nSozlamalar → Maxfiylik va xavfsizlik → Universal Access ro'yxatida «RubaiSTT Dictation» yoqilsin."
-            a.addButton(withTitle: "Sozlamani ochish")
-            a.addButton(withTitle: "Keyinroq")
+            a.messageText = "Нет Универсального доступа"
+            a.informativeText = "Поэтому текст не вставился сам — он в буфере обмена (вставьте ⌘V).\n\nНастройки → Конфиденциальность и безопасность → Универсальный доступ → включите «RubaiSTT Dictation»."
+            a.addButton(withTitle: "Открыть настройки")
+            a.addButton(withTitle: "Позже")
             NSApp.activate(ignoringOtherApps: true)
             if a.runModal() == .alertFirstButtonReturn {
                 let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -2176,27 +2218,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func refreshLangMenu() {
-        langItemRU?.state = lang == "ru" ? .on : .off
-        langItemUZ?.state = lang == "uz" ? .on : .off
-    }
-
-    @objc private func pickRU() { switchLanguage("ru") }
-    @objc private func pickUZ() { switchLanguage("uz") }
-
     @objc private func toggleAccuracy() {
         accurate.toggle()
         accurateItem.state = accurate ? .on : .off
         rubai_set_accuracy(accurate ? 1 : 0)
-        NSLog("[rubai] aniqroq rejim: \(accurate)")
-        overlay.flash(accurate ? "Aniqroq rejim" : "Tez rejim", seconds: 1.2)
+        rlog("[rubai] aniqroq rejim: \(accurate)")
+        overlay.flash(accurate ? "Точный режим" : "Быстрый режим", seconds: 1.2)
     }
 
     @objc private func toggleStreaming() {
         streaming.toggle()
         streamItem.state = streaming ? .on : .off
-        NSLog("[rubai] gapirganda tanish: \(streaming)")
-        overlay.flash(streaming ? "Gapirganda tanish" : "Oxirida tanish", seconds: 1.2)
+        rlog("[rubai] gapirganda tanish: \(streaming)")
+        overlay.flash(streaming ? "Во время речи" : "В конце", seconds: 1.2)
     }
 
     @objc private func toggleLogin() {
@@ -2228,8 +2262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if rec.isRecording {
             stopAndTranscribe()
         } else {
-            startedByTapSeries = false
-            start(lang: lang)
+            start()
         }
     }
 

@@ -4,64 +4,31 @@
 #include <string.h>
 #include <stdio.h>
 
-static struct whisper_context *g_ctx = NULL;    // rubaiSTT (uz, ixtisoslashgan)
-static struct whisper_context *g_ctx_ru = NULL; // oddiy ko'p tilli Whisper (ru, kirillcha uchun)
-static char g_model_dir[900] = {0};
-
-// Joriy til — Swift tomonidan rubai_set_language() orqali beriladi.
-// Oldin ~/.rubaistt_lang fayli o'qilardi (Hammerspoon uchun); endi kerak emas.
-static char g_lang[8] = "ru";
+// Одна модель — только русский (узбекский убран 25.09.2026 по просьбе владельца).
+static struct whisper_context *g_ctx = NULL;
 
 // 0 = tez (greedy), 1 = aniq (beam search). Menyudan almashtiriladi.
 static int g_accurate = 0;
 
 void rubai_set_accuracy(int accurate) { g_accurate = accurate ? 1 : 0; }
 
-void rubai_set_language(const char *lang) {
-    if (!lang) return;
-    if (strcmp(lang, "ru") == 0) strcpy(g_lang, "ru");
-    else                         strcpy(g_lang, "uz");
-}
-
 int rubai_load(const char *model_path) {
     if (g_ctx) return 0;
 
-    // ru-model shu papkadan izlanadi ("ggml-multilingual.bin"), rubaistt bilan bitta joyda.
-    strncpy(g_model_dir, model_path, sizeof(g_model_dir) - 1);
-    g_model_dir[sizeof(g_model_dir) - 1] = '\0';
-    char *slash = strrchr(g_model_dir, '/');
-    if (slash) *slash = '\0'; else g_model_dir[0] = '\0';
-
     struct whisper_context_params cp = whisper_context_default_params();
+#if defined(__aarch64__)
+    // Apple Silicon: Metal на порядок быстрее CPU и почти не греет процессор.
+    // flash_attn на Metal — ещё быстрее и меньше памяти.
+    cp.use_gpu = true;
+    cp.flash_attn = true;
+#else
     // Metal bu Mac'da (AMD Radeon Pro, Metal 2) CPU'dan ~24 barobar sekin —
     // o'lchandi, shuning uchun GPU o'chirilgan.
     cp.use_gpu = false;
     cp.flash_attn = false;
+#endif
     g_ctx = whisper_init_from_file_with_params(model_path, cp);
     return g_ctx ? 0 : 1;
-}
-
-// ru-context (ko'p tilli small model).
-static struct whisper_context *rubai_ru_ctx(void) {
-    if (g_ctx_ru) return g_ctx_ru;
-    if (g_model_dir[0] == '\0') return NULL;
-
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/ggml-multilingual.bin", g_model_dir);
-
-    struct whisper_context_params cp = whisper_context_default_params();
-    cp.use_gpu = false;
-    cp.flash_attn = false;
-    g_ctx_ru = whisper_init_from_file_with_params(path, cp);
-    return g_ctx_ru;
-}
-
-// Modelni oldindan (fon oqimida) yuklab qo'yish — birinchi diktovkadagi
-// ~1.3 s "model yuklanmoqda" kutishini yo'q qiladi.
-int rubai_preload(const char *model_path, const char *lang) {
-    if (rubai_load(model_path) != 0) return 1;
-    if (lang && strcmp(lang, "ru") == 0) return rubai_ru_ctx() ? 0 : 1;
-    return 0;
 }
 
 void rubai_unload(void) {
@@ -69,20 +36,11 @@ void rubai_unload(void) {
         whisper_free(g_ctx);
         g_ctx = NULL;
     }
-    if (g_ctx_ru) {
-        whisper_free(g_ctx_ru);
-        g_ctx_ru = NULL;
-    }
 }
 
 char *rubai_transcribe(const float *samples, int n_samples, int n_threads,
                        int accurate, int full_ctx, const char *prompt) {
-    const char *lang = g_lang;
-
     struct whisper_context *ctx = g_ctx;
-    if (strcmp(lang, "ru") == 0) {
-        ctx = rubai_ru_ctx(); // kirillcha uchun oddiy ko'p tilli model
-    }
     if (!ctx) return NULL;
 
     // accurate < 0 — menyudagi umumiy sozlama. Oqimli rejimda esa fon bo'laklari
@@ -97,7 +55,7 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads,
         : whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     if (acc) p.beam_search.beam_size = 3;
     else     p.greedy.best_of = 1;
-    p.language          = lang;
+    p.language          = "ru";
     p.translate         = false;
     p.n_threads         = n_threads > 0 ? n_threads : 4;
     p.no_timestamps     = true;
@@ -110,13 +68,10 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads,
     // Kontekst maslahati: modelga qaysi atamalar uchrashini oldindan aytamiz.
     // Whisper ularni "eshitishga tayyor" bo'ladi va «Supabase»ni «Суп абаз» deb
     // yozmaydi. Tezlikka ta'siri yo'q — bu shunchaki dekoder uchun old matn.
-    const char *terms = (strcmp(lang, "ru") == 0)
-        ? "Разговор про разработку: Supabase, Railway, Vercel, Odoo, Telegram, "
-          "бот, API, Docker, GitHub, Nvidia, Claude, деплой, база данных, "
-          "курьер, заказ, склад, касса, сум."
-        : "Dasturlash haqida suhbat: Supabase, Railway, Vercel, Odoo, Telegram, "
-          "bot, API, Docker, GitHub, Nvidia, Claude, ma'lumotlar bazasi, "
-          "kuryer, buyurtma, ombor, kassa, so'm.";
+    const char *terms =
+        "Разговор про разработку: Supabase, Railway, Vercel, Web App, Mini App, "
+        "Telegram, Odoo, бот, API, Docker, GitHub, Nvidia, Claude, деплой, "
+        "база данных, курьер, заказ, склад, касса, сум.";
 
     // Oqimli rejimda oldingi bo'lakning oxiri ham beriladi: bo'lak chegarasida
     // dekoder gapning boshini bilmay qolmasin. Tezlikka ta'siri yo'q — bu shunchaki
@@ -154,6 +109,12 @@ char *rubai_transcribe(const float *samples, int n_samples, int n_threads,
     // LEKIN: qisqartirilgan audio_ctx aniqlikni ham pasaytiradi. Oqimli rejimda
     // fon bo'laklari uchun full_ctx=1 beriladi — odam hali gapirayotgani uchun
     // u yerda vaqt baribir bo'sh turardi, aniqlik esa muhim.
+#if defined(__aarch64__)
+    // large-v3-turbo с урезанным audio_ctx зацикливается: замер 25.09.2026 на
+    // фразе 3 с — audio_ctx=200 дал её 6 раз подряд. На Metal полный контекст
+    // стоит ~0,5 с, поэтому всегда полный.
+    full_ctx = 1;
+#endif
     if (full_ctx) {
         p.audio_ctx = 0;   // 0 = modelning to'liq oynasi (1500)
     } else {
