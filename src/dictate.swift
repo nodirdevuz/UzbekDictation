@@ -1207,12 +1207,35 @@ enum Inserter {
     // Есть ли куда вставлять. false — только когда УВЕРЕНЫ, что поля ввода нет.
     // Системный AXFocusedUIElement на macOS 26 отвечает -25204 (замер 25.09.2026),
     // поэтому спрашиваем у активного приложения.
+    // Electron/Chromium (Claude, Telegram Desktop, VS Code, Slack…) не строят дерево
+    // доступности, пока его не попросить: фокус отвечает -25212 даже при курсоре в поле,
+    // и текст раньше только копировался (замер 25.09.2026, Claude.app). Флаг
+    // AXManualAccessibility будит дерево; зовём на старте записи — к ⌘ оно уже готово.
+    static func wakeAccessibility(_ app: NSRunningApplication? = NSWorkspace.shared.frontmostApplication) {
+        guard let app = app else { return }
+        let ae = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetAttributeValue(ae, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    }
+
     static func hasTextTarget() -> Bool {
         guard let app = NSWorkspace.shared.frontmostApplication else { return true }
         let ae = AXUIElementCreateApplication(app.processIdentifier)
         var f: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(ae, kAXFocusedUIElementAttribute as CFString, &f)
-        if err == .noValue { rlog("[rubai] fokus yo'q (\(app.localizedName ?? "?"))"); return false }
+        var err = AXUIElementCopyAttributeValue(ae, kAXFocusedUIElementAttribute as CFString, &f)
+        if err == .noValue {
+            // Дерево могло не проснуться (приложение переключили во время записи).
+            wakeAccessibility(app)
+            usleep(150_000)
+            err = AXUIElementCopyAttributeValue(ae, kAXFocusedUIElementAttribute as CFString, &f)
+        }
+        if err == .noValue {
+            // Окно есть, а фокус не отдают — скорее всего поле, которого AX не видит.
+            // Копировать-только — лишь когда у приложения вообще нет окна.
+            var w: CFTypeRef?
+            let hasWindow = AXUIElementCopyAttributeValue(ae, kAXFocusedWindowAttribute as CFString, &w) == .success
+            rlog("[rubai] fokus yo'q (\(app.localizedName ?? "?")) oyna=\(hasWindow)")
+            return hasWindow && app.bundleIdentifier != "com.apple.finder"
+        }
         guard err == .success, let fr = f, CFGetTypeID(fr) == AXUIElementGetTypeID() else { return true }
         let el = fr as! AXUIElement
         var r: CFTypeRef?
@@ -1994,6 +2017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordStartedAt = ProcessInfo.processInfo.systemUptime
         // Модель грузится параллельно с речью — к моменту ⌘ она уже готова.
         Whisper.shared.preload()
+        Inserter.wakeAccessibility()
         rec.start { [weak self] ok in
             guard let self = self else { return }
             rlog("[rubai] record start ok=\(ok)")
