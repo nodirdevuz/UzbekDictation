@@ -2,9 +2,10 @@
 // Egasini bezovta qilmasdan to'liq siklni sinash imkonini beradi.
 //
 //   swiftc -O tools/simulate-taps.swift -o /tmp/taps
-//   /tmp/taps tap2   — ⌘⌘   (yozishni boshlash, ruscha)
-//   /tmp/taps tap3   — ⌘⌘⌘  (yozishni boshlash, o'zbekcha)
-//   /tmp/taps tap1   — ⌘     (to'xtatish va matnni qo'yish)
+//   /tmp/taps tap2   — левый ⌘⌘  (старт записи)
+//   /tmp/taps rtap2  — правый ⌘⌘ (старт записи)
+//   /tmp/taps tap1   — левый ⌘   (стоп и вставка; без записи — ничего не делает)
+//   /tmp/taps rtap1  — правый ⌘  (то же самое)
 //   /tmp/taps cmdc   — ⌘C ikki marta: yozish BOSHLANMASLIGI kerak
 //   /tmp/taps hold   — ⌘ ni uzoq ushlash: yozish boshlanmasligi kerak
 //   /tmp/taps esc    — ⎋ (bekor qilish)
@@ -21,11 +22,11 @@ func post(_ key: CGKeyCode, _ down: Bool, _ flags: CGEventFlags = []) {
     e?.post(tap: .cghidEventTap)
 }
 
-/// Bitta toza ⌘ "tap"i
-func cmdTap(hold: UInt32 = 60_000) {
-    post(55, true, .maskCommand)
+/// Bitta toza ⌘ "tap"i. 55 — левый ⌘, 54 — правый.
+func cmdTap(hold: UInt32 = 60_000, key: CGKeyCode = 55) {
+    post(key, true, .maskCommand)
     usleep(hold)
-    post(55, false, [])
+    post(key, false, [])
 }
 
 /// ⌘C — birikma, u hech qachon tap deb hisoblanmasligi kerak
@@ -38,8 +39,9 @@ func cmdC() {
 let mode = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "tap2"
 switch mode {
 case "tap1": cmdTap()
+case "rtap1": cmdTap(key: 54)
 case "tap2": cmdTap(); usleep(140_000); cmdTap()
-case "tap3": cmdTap(); usleep(130_000); cmdTap(); usleep(130_000); cmdTap()
+case "rtap2": cmdTap(key: 54); usleep(140_000); cmdTap(key: 54)
 case "cmdc": cmdC(); usleep(150_000); cmdC()
 case "hold": post(55, true, .maskCommand); usleep(900_000); post(55, false, [])
 case "esc":  post(53, true, []); usleep(20_000); post(53, false, [])

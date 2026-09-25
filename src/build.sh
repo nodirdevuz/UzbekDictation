@@ -22,6 +22,21 @@ fi
 # Kompyuterni qizdirmaslik uchun past prioritet bilan
 NICE="nice -n 10"
 
+# Command Line Tools бывают «наполовину обновлены»: новейший SDK собран более новым
+# Swift, чем установленный компилятор, и сборка падает («this SDK is not supported by
+# the compiler»). Тогда берём самый свежий SDK, который этот компилятор понимает.
+if [ -z "$SDKROOT" ]; then
+    probe="$(mktemp -d)"
+    echo 'import AppKit' > "$probe/p.swift"
+    for sdk in $(xcrun --show-sdk-path) $(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.sdk 2>/dev/null | sort -rV); do
+        if SDKROOT="$sdk" swiftc -typecheck "$probe/p.swift" >/dev/null 2>&1; then
+            export SDKROOT="$sdk"; break
+        fi
+    done
+    rm -rf "$probe"
+    echo "SDK: ${SDKROOT:-standart}"
+fi
+
 COMMON_FW="-framework Foundation -framework Accelerate -framework AVFoundation \
     -framework AppKit -framework QuartzCore -framework CoreGraphics \
     -framework Carbon -framework ApplicationServices"
@@ -34,6 +49,9 @@ for ARCH in "${ARCHS[@]}"; do
         # arm64 — Metal backend'ni force_load + Metal freymvorklari
         METAL="-Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-metal/libggml-metal.a \
             -framework Metal -framework MetalKit"
+        # whisper.cpp собран с BLAS (Accelerate) — его бэкенд тоже надо прилинковать
+        [ -f "$LIB/ggml/src/ggml-blas/libggml-blas.a" ] && \
+            METAL="$METAL -Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-blas/libggml-blas.a"
     else
         # x86_64 — faqat CPU. Metal bu Mac'da (AMD Radeon Pro) CPU'dan ~24 barobar
         # sekin chiqdi, shuning uchun ulanmaydi. BLAS (Accelerate) backend kerak.
@@ -43,7 +61,7 @@ for ARCH in "${ARCHS[@]}"; do
     echo "  -> $ARCH"
     $NICE clang -c "$SRC/whisper_bridge.c" -arch "$ARCH" -O2 \
         -I"$WC/include" -I"$WC/ggml/include" -o "$SRC/whisper_bridge.$ARCH.o"
-    $NICE swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/whisper_bridge.$ARCH.o" \
+    $NICE swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/whisper_bridge.$ARCH.o" \
         -import-objc-header "$SRC/Bridging.h" \
         "$LIB/src/libwhisper.a" \
         "$LIB/ggml/src/libggml.a" \
@@ -86,7 +104,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>NSMicrophoneUsageDescription</key><string>Ovozingizni matnga o'girish uchun mikrofon kerak.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Микрофон нужен, чтобы превращать голос в текст.</string>
 </dict>
 </plist>
 PLIST

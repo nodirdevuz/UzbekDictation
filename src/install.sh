@@ -30,13 +30,20 @@ else
 fi
 
 echo "[2/5] Modellar tekshirilmoqda"
-for m in ggml-rubaistt.bin ggml-multilingual.bin; do
-    if [ -f "$APP/Contents/Resources/$m" ]; then
-        echo "  ✓ $m"
-    else
-        echo "  ✗ $m TOPILMADI — diktovka ishlamaydi!" >&2
-    fi
+# Имя должно совпадать с Whisper.modelFile в dictate.swift
+MODEL="ggml-large-v3-turbo-q5_0.bin"
+if [ ! -f "$APP/Contents/Resources/$MODEL" ] && [ -f "$HOME/rubai-stt/models/$MODEL" ]; then
+    cp "$HOME/rubai-stt/models/$MODEL" "$APP/Contents/Resources/$MODEL"
+fi
+# Прочие модели (узбекская, small, прежняя turbo) не используются — освобождаем место
+for old in "$APP"/Contents/Resources/ggml-*.bin; do
+    [ "$(basename "$old")" = "$MODEL" ] || rm -f "$old"
 done
+if [ -f "$APP/Contents/Resources/$MODEL" ]; then
+    echo "  ✓ $MODEL"
+else
+    echo "  ✗ $MODEL TOPILMADI — diktovka ishlamaydi! (~/rubai-stt/models ga yuklab qo'ying)" >&2
+fi
 
 echo "[3/5] Imzolash"
 xattr -cr "$APP" 2>/dev/null || true

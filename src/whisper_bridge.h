@@ -4,12 +4,6 @@
 // Modelni yuklaydi (bir marta). 0 = muvaffaqiyat.
 int rubai_load(const char *model_path);
 
-// Modelni (va kerak bo'lsa ru-modelni) oldindan yuklaydi. 0 = muvaffaqiyat.
-int rubai_preload(const char *model_path, const char *lang);
-
-// Keyingi rubai_transcribe uchun tilni belgilaydi: "uz" yoki "ru".
-void rubai_set_language(const char *lang);
-
 // 0 = tez (greedy), 1 = aniqroq (beam search 3, ~2 barobar sekin).
 void rubai_set_accuracy(int accurate);
 
