@@ -260,6 +260,8 @@ enum InputDevice {
     // Kolonka har ulanganda macOS uni yana kirish qilib qo'yadi — shuning uchun
     // bir marta tuzatish yetmaydi, o'zgarishni kuzatib turamiz. O'zimiz qo'ygan
     // qiymat ham hodisa keltiradi, lekin u BT bo'lmagani uchun tsikl bo'lmaydi.
+    // Синхронные вызовы HAL (AudioObjectSetPropertyData) тоже могут зависнуть — не в главном потоке.
+    static let halQ = DispatchQueue(label: "rubai.hal")
     private static var listening = false
     static func watchSystemInput() {
         guard !listening else { return }
@@ -269,7 +271,7 @@ enum InputDevice {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
-                                            &addr, DispatchQueue.main) { _, _ in
+                                            &addr, halQ) { _, _ in
             keepSystemInputOffBluetooth()
         }
     }
@@ -285,7 +287,19 @@ final class Recorder {
                                        sampleRate: 16000, channels: 1, interleaved: false)!
     private var samples: [Float] = []
     private let lock = NSLock()
-    private(set) var isRecording = false
+    // Читают из главного потока, сторожа и очереди аудио — поэтому под замком.
+    private var _recording = false
+    var isRecording: Bool { lock.lock(); defer { lock.unlock() }; return _recording }
+    private func setRecording(_ v: Bool) { lock.lock(); _recording = v; lock.unlock() }
+
+    // Весь CoreAudio (старт, перезапуск графа, остановка движка) ходит только сюда, НИКОГДА
+    // в главный поток. 02.10.2026 один синхронный вызов `engine.inputNode` повис навсегда после
+    // отключения Bluetooth-гарнитуры и заморозил всё приложение (и обработчик ⌘ заодно).
+    private let audioQ = DispatchQueue(label: "rubai.audio")
+    // Идёт старт/перезапуск графа (читать/писать только из главного потока).
+    private(set) var starting = false
+    // Сколько ждём ответа CoreAudio, прежде чем считать его зависшим и перезапустить приложение.
+    static let audioTimeout: TimeInterval = ProcessInfo.processInfo.environment["RUBAI_SELFTEST"] != nil ? 3 : 6
 
     // Qaysi mikrofondan yozyapmiz — xabar va log uchun.
     private(set) var deviceName = "?"
@@ -312,16 +326,52 @@ final class Recorder {
 
     func start(_ cb: @escaping (Bool) -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: cb(begin())
+        case .authorized: launch(cb)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { ok in
-                DispatchQueue.main.async { cb(ok ? self.begin() : false) }
+                DispatchQueue.main.async { ok ? self.launch(cb) : cb(false) }
             }
         default: cb(false)
         }
     }
 
+    private func launch(_ cb: @escaping (Bool) -> Void) {
+        starting = true
+        runOnAudio("start", { self.begin() }) { ok in
+            self.starting = false
+            cb(ok)
+        }
+    }
+
+    // Выполнить работу с CoreAudio на очереди аудио; ответ — в главный поток. Если за audioTimeout
+    // ответа нет — CoreAudio завис, и единственное лекарство — перезапуск процесса (heal не возвращается).
+    private func runOnAudio(_ label: String, _ work: @escaping () -> Bool, done: @escaping (Bool) -> Void) {
+        var answered = false   // трогаем только в главном потоке
+        let timeout = DispatchWorkItem {
+            guard !answered else { return }
+            answered = true
+            Supervisor.shared.heal("CoreAudio не ответил за \(Int(Recorder.audioTimeout)) с (\(label))")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Recorder.audioTimeout, execute: timeout)
+        audioQ.async {
+            let ok = work()
+            DispatchQueue.main.async {
+                guard !answered else { return }
+                answered = true
+                timeout.cancel()
+                done(ok)
+            }
+        }
+    }
+
+    // Снять тап и остановить движок. Только на очереди аудио.
+    private func teardown(_ e: AVAudioEngine) {
+        e.inputNode.removeTap(onBus: 0)
+        e.stop()
+    }
+
     private func begin() -> Bool {
+        if ProcessInfo.processInfo.environment["RUBAI_SELFTEST"] == "audiohang" { sleep(60) }
         lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
 
         // Bluetooth kolonka kirishni egallab olgan bo'lsa — qaytarib olamiz.
@@ -368,7 +418,7 @@ final class Recorder {
         // umuman boshlanmasdi (ilova tirik, lekin ovoz yozilmaydi).
         var hw = input.inputFormat(forBus: 0)
         if hw.sampleRate <= 0 { hw = input.outputFormat(forBus: 0) }
-        guard hw.sampleRate > 0 else { return false }
+        guard hw.sampleRate > 0 else { teardown(engine); return false }
         rlog("[rubai] mikrofon: \(deviceName) — \(Int(hw.sampleRate)) Hz, \(hw.channelCount) kanal")
         converter = AVAudioConverter(from: hw, to: target)
         convFrom = hw
@@ -422,31 +472,42 @@ final class Recorder {
             }
         }
         engine.prepare()
-        do { try engine.start() } catch { return false }
-        isRecording = true
+        do { try engine.start() } catch {
+            // Не оставляем наполовину собранный граф с тапом — он продолжал бы дёргать CoreAudio.
+            rlog("[rubai] engine.start xato: \(error.localizedDescription)")
+            teardown(engine)
+            return false
+        }
+        setRecording(true)
         return true
     }
 
     // Graf ishga tushdi, lekin bitta ham bufer bermadi — CoreAudio o'sha payt
     // qurilma almashtirish bilan band bo'lgan. Grafni qaytadan yig'amiz:
     // yo'qotadigan narsa yo'q (bufer kelmagan), yozuv esa davom etadi.
-    @discardableResult
-    func restartEngine() -> Bool {
-        guard isRecording else { return false }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        isRecording = false
-        let ok = begin()
-        rlog("[rubai] audio grafi qayta yig'ildi: \(ok ? "ok" : "muvaffaqiyatsiz")")
-        return ok
+    func restartEngine(_ done: @escaping (Bool) -> Void) {
+        guard isRecording else { done(false); return }
+        starting = true
+        runOnAudio("restart", {
+            self.teardown(self.engine)
+            self.setRecording(false)
+            let ok = self.begin()
+            rlog("[rubai] audio grafi qayta yig'ildi: \(ok ? "ok" : "muvaffaqiyatsiz")")
+            return ok
+        }) { ok in
+            self.starting = false
+            done(ok)
+        }
     }
 
+    // Главный поток отдаёт то, что накоплено, мгновенно; движок гасится на очереди аудио, чтобы
+    // зависший CoreAudio не мог заморозить ни ⌘, ни меню.
     func stop() -> [Float] {
         guard isRecording else { return [] }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        isRecording = false
+        setRecording(false)
         lock.lock(); let s = samples; lock.unlock()
+        let e = engine
+        audioQ.async { self.teardown(e) }
         return s
     }
 
@@ -1936,8 +1997,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Bluetooth kolonka mikrofon bo'lib qolmasin — diktovka boshlanishini
         // kutmasdan, hozirdanoq. Kolonka HFP'dan chiqadi va musiqa ham tiniq
         // chalinadi (HFP'da u 8 kHz — "telefon ovozi").
-        InputDevice.keepSystemInputOffBluetooth()
+        InputDevice.halQ.async { InputDevice.keepSystemInputOffBluetooth() }
         InputDevice.watchSystemInput()
+
+        // Самолечение: сторож в отдельном потоке (см. supervisor.swift) + снять метку «закрыто вручную».
+        try? FileManager.default.removeItem(at: Supervisor.quitFlag)
+        Supervisor.shared.isRecording = { [weak self] in self?.rec.isRecording ?? false }
+        Supervisor.shared.start()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "rubaiSTT")
@@ -2014,6 +2080,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func start() {
+        guard !rec.starting else { return }   // предыдущий старт ещё не ответил
+        Supervisor.shared.touch()
         recordStartedAt = ProcessInfo.processInfo.systemUptime
         // Модель грузится параллельно с речью — к моменту ⌘ она уже готова.
         Whisper.shared.preload()
@@ -2026,6 +2094,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.streamingNow { self.stream.begin() }
                 self.overlay.showRecording(lang: "ru")
                 self.watchSilentMic()
+                // Предохранитель: запись, про которую забыли (или потеряли ⌘), не должна жить вечно.
+                let no = self.rec.sessionNo
+                DispatchQueue.main.asyncAfter(deadline: .now() + 20 * 60) { [weak self] in
+                    guard let self = self, self.rec.isRecording, self.rec.sessionNo == no else { return }
+                    rlog("[rubai] 20 daqiqa — yozuv avtomatik to'xtatildi")
+                    self.stopAndTranscribe()
+                }
             } else {
                 self.overlay.flash("Нет доступа к микрофону", seconds: 2.0)
                 Whisper.shared.scheduleUnload()
@@ -2049,22 +2124,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // HFP'ga o'tayotgan bo'lsa) grafimizga umuman bufer bermaydi. Bunda
             // grafni qayta yig'ib, yana bir imkon beramiz — odam buni sezmaydi ham.
             // Buferlar kelyapti-yu, ichi toza nol bo'lsa — mana bu o'lik kanal.
-            if self.rec.buffersSeen == 0 && !lastChance, self.rec.restartEngine() {
-                self.watchSilentMic(after: 2.0, lastChance: true)
+            let giveUp = { [weak self] in
+                guard let self = self else { return }
+                rlog("[rubai] mikrofon jim: \(self.rec.deviceName) — ovoz yo'q (bufer: \(self.rec.buffersSeen))")
+                _ = self.rec.stop()
+                if self.streamingNow { self.stream.abort(); self.streamingNow = false }
+                self.taps.resetSeries()
+                self.overlay.flash("Микрофон молчит", seconds: 2.5)   // qurilma nomi logda
+                Whisper.shared.scheduleUnload()
+            }
+            if self.rec.buffersSeen == 0 && !lastChance {
+                self.rec.restartEngine { [weak self] ok in
+                    guard let self = self else { return }
+                    if ok { self.watchSilentMic(after: 2.0, lastChance: true) } else { giveUp() }
+                }
                 return
             }
-
-            rlog("[rubai] mikrofon jim: \(self.rec.deviceName) — ovoz yo'q (bufer: \(self.rec.buffersSeen))")
-            _ = self.rec.stop()
-            if self.streamingNow { self.stream.abort(); self.streamingNow = false }
-            self.taps.resetSeries()
-            self.overlay.flash("Микрофон молчит", seconds: 2.5)   // qurilma nomi logda
-            Whisper.shared.scheduleUnload()
+            giveUp()
         }
     }
 
     private func stopAndTranscribe() {
         guard rec.isRecording else { return }
+        Supervisor.shared.touch()
         taps.resetSeries()
         let t0 = Date()
         let raw = rec.stop()
@@ -2111,6 +2193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Tanilgan matnni tozalab, faol maydonga qo'yish. Ikkala yo'l uchun bitta joy.
     private func deliver(_ text: String) {
+        Supervisor.shared.touch()
         rlog("[rubai] natija: '\(text)' (uzunlik=\(text.count))")
         overlay.hide()
         Inserter.insert(Terms.fix(AppDelegate.collapseRepeats(AppDelegate.dropHallucination(text))))
@@ -2290,7 +2373,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func quit() { rubai_unload(); NSApp.terminate(nil) }
+    // Выход из меню = «так и надо»: метка, чтобы launchd-страховка не поднимала приложение обратно.
+    @objc private func quit() {
+        try? FileManager.default.createDirectory(at: Supervisor.quitFlag.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data().write(to: Supervisor.quitFlag)
+        rubai_unload(); NSApp.terminate(nil)
+    }
     func applicationWillTerminate(_ n: Notification) { rubai_unload() }
 }
 

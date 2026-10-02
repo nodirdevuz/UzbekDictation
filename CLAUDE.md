@@ -64,6 +64,40 @@ Intel/i9 и «Metal в 24 раза медленнее», относится к �
   вырезать `CapsuleView` из dictate.swift и нарисовать в `NSBitmapImageRep`.
 - Модель лежит в `~/rubai-stt/models/`, `install.sh` сам кладёт её в `/Applications/…/Resources`.
 
+## 🛡 Отказоустойчивость (02.10.2026) — прочитать до правок записи
+
+**Что сломалось.** После отключения Bluetooth-гарнитуры (`марьям`) macOS сменил устройства, и
+`AVAudioEngine.inputNode` (синхронный запрос к coreaudiod) повис навсегда. Вызов шёл из обработчика
+⌘ в **главном потоке** → заморожены ⌘, меню и капсула, а `coreaudiod` (66 %) и мы (33 %) грели
+Mac часами. Видно было так: `sample <pid>` — главный поток в `Recorder.begin → inputNode →
+AVAudioIOUnit::GetHWFormat → mach_msg`; в логе `model yuklandi` без `record start`.
+
+**Что теперь (три слоя, все проверены на живых сбоях):**
+
+1. **CoreAudio — только на очереди `audioQ`, никогда в главном потоке** (`Recorder.runOnAudio`):
+   старт, перезапуск графа, гашение движка. `stop()` отдаёт накопленное мгновенно, движок
+   гасится на очереди. HAL-вызовы (`InputDevice`) — на `InputDevice.halQ`. При неудаче
+   `begin()` граф с тапом снимается (раньше оставался висеть). `isRecording` — под замком.
+2. **Сторож `src/supervisor.swift`** в отдельном потоке (в CoreAudio и главный поток не ходит):
+   перезапускает приложение (`_exit(75)` + `open -a`), если (а) главный поток молчит > 20 с;
+   (б) CoreAudio не ответил на старт/перезапуск за 6 с; (в) в простое (не пишем, > 150 с без
+   дел) процессор > 25 % три окна по 30 с подряд. Не чаще 3 раз за 10 минут, дальше — launchd.
+   Журнал: `~/Library/Logs/RubaiSTT-self-heal.log`, в `rlog` — `SAMOLECHENIE:`; пользователю
+   приходит уведомление «Диктовка зависла и перезапущена. Нажмите ⌘⌘ ещё раз».
+3. **launchd-страховка** `~/Library/LaunchAgents/com.rubaistt.dictation.keepalive.plist`
+   (ставит `install.sh`, раз в 2 минуты `pgrep || open`): поднимает приложение, если процесс умер
+   (краш, kill). «Выйти» из меню ставит метку `~/Library/Application Support/RubaiSTT/user-quit`
+   — тогда не поднимает; метка снимается при следующем запуске.
+
+Плюс предохранитель: запись длиннее 20 минут останавливается сама.
+
+**Самотест сторожа** (сбоев ждать не нужно). Остановить боевое приложение, затем:
+`RUBAI_SELFTEST=hang|spin|audiohang "~/Applications/RubaiSTT Dictation.app/Contents/MacOS/RubaiSTTDictation"`
+(`audiohang` — ещё нажать ⌘⌘ через `tools/simulate-taps`). Пороги в этом режиме сжаты до секунд;
+результат 02.10.2026: hang → перезапуск за 6 с, spin → 9 с, audiohang → 3 с. Побочно: перезапущенная
+копия наследует переменную окружения — после теста убить её и запустить `install.sh`.
+`tools/simulate-taps.swift` на этой машине собирается с `SDKROOT=…/MacOSX26.5.sdk`.
+
 ## Что это
 
 Системная диктовка речь→текст для macOS. Работает **офлайн** через whisper.cpp.

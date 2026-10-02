@@ -19,17 +19,17 @@ LOCAL_ID="RubaiSTT Local Signing"
 [ -f "$BUILT/Contents/MacOS/RubaiSTTDictation" ] || { echo "Avval src/build.sh ni ishga tushiring" >&2; exit 1; }
 
 if [ ! -d "$APP" ]; then
-    echo "[1/5] /Applications da nusxa yo'q — to'liq ko'chiramiz"
+    echo "[1/6] /Applications da nusxa yo'q — to'liq ko'chiramiz"
     cp -R "$BUILT" "$APP"
 else
-    echo "[1/5] Binarnik yangilanmoqda (modellar joyida qoladi)"
+    echo "[1/6] Binarnik yangilanmoqda (modellar joyida qoladi)"
     pkill -f RubaiSTTDictation 2>/dev/null || true
     sleep 1
     cp "$BUILT/Contents/MacOS/RubaiSTTDictation" "$APP/Contents/MacOS/RubaiSTTDictation"
     cp "$BUILT/Contents/Info.plist" "$APP/Contents/Info.plist"
 fi
 
-echo "[2/5] Modellar tekshirilmoqda"
+echo "[2/6] Modellar tekshirilmoqda"
 # Имя должно совпадать с Whisper.modelFile в dictate.swift
 MODEL="ggml-large-v3-turbo-q5_0.bin"
 if [ ! -f "$APP/Contents/Resources/$MODEL" ] && [ -f "$HOME/rubai-stt/models/$MODEL" ]; then
@@ -45,7 +45,7 @@ else
     echo "  ✗ $MODEL TOPILMADI — diktovka ishlamaydi! (~/rubai-stt/models ga yuklab qo'ying)" >&2
 fi
 
-echo "[3/5] Imzolash"
+echo "[3/6] Imzolash"
 xattr -cr "$APP" 2>/dev/null || true
 if security find-certificate -c "$LOCAL_ID" >/dev/null 2>&1; then
     codesign --force --deep --sign "$LOCAL_ID" --entitlements "$SRC/entitlements.plist" "$APP" 2>/dev/null \
@@ -57,11 +57,37 @@ else
     echo "  DIQQAT: ad-hoc imzo — har build'dan keyin Accessibility ruxsatini qayta berish kerak bo'ladi" >&2
 fi
 
-echo "[4/5] Ishga tushirish"
+echo "[4/6] Ishga tushirish"
 open "$APP"
 sleep 3
 
-echo "[5/5] Login'da avtomatik ishga tushishi"
+echo "[5/6] launchd-sug'urta (jarayon o'lsa, 2 daqiqada qaytadan ko'taradi)"
+# Приложение само лечит зависания (src/supervisor.swift), но если процесс УМЕР (краш, kill),
+# кроме launchd его поднять некому. Выход из меню («Выйти») ставит метку user-quit — тогда не поднимаем.
+KA="$HOME/Library/LaunchAgents/com.rubaistt.dictation.keepalive.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$KA" <<'PL'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.rubaistt.dictation.keepalive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>[ -e "$HOME/Library/Application Support/RubaiSTT/user-quit" ] &amp;&amp; exit 0; /usr/bin/pgrep -x RubaiSTTDictation &gt;/dev/null || /usr/bin/open -a "/Applications/RubaiSTT Dictation.app"</string>
+    </array>
+    <key>StartInterval</key><integer>120</integer>
+    <key>RunAtLoad</key><false/>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PL
+launchctl bootout "gui/$(id -u)" "$KA" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$KA" && echo "  ✓ keepalive o'rnatildi"
+
+echo "[6/6] Login'da avtomatik ishga tushishi"
 if launchctl list 2>/dev/null | grep -q com.rubaistt.dictation; then
     echo "  ✓ ro'yxatdan o'tgan"
 else
