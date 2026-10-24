@@ -1,21 +1,14 @@
 #!/bin/bash
 # RubaiSTT Dictation — native macOS ilovasini build qiladi.
-# whisper.cpp statik kutubxonalari $ROOT/whisper.cpp/build-static da bo'lishi kerak
-# (setup.sh buni avtomatik tayyorlaydi).
 set -e
 SRC="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SRC/.." && pwd)"
-WC="$ROOT/whisper.cpp"
-LIB_ARM="$WC/build-static"   # arm64 — Metal GPU
-LIB_X64="$WC/build-x64"      # x86_64 — faqat CPU (Intel)
+# Движок распознавания — sherpa-onnx + GigaAM v3 (с 25.10.2026, вместо whisper.cpp).
+# Библиотеки скачивает tools/fetch-gigaam.sh. Только arm64 (Apple Silicon).
+SO="$ROOT/sherpa-onnx"
 APP="$HOME/Applications/RubaiSTT Dictation.app"
-
-# Qaysi arxitekturalar build qilinadi — mavjud kutubxonalarga qarab.
-ARCHS=()
-[ -f "$LIB_ARM/src/libwhisper.a" ] && ARCHS+=("arm64")
-[ -f "$LIB_X64/src/libwhisper.a" ] && ARCHS+=("x86_64")
-if [ ${#ARCHS[@]} -eq 0 ]; then
-    echo "Xato: whisper.cpp statik kutubxonalari topilmadi ($LIB_ARM yoki $LIB_X64). Avval setup.sh ni ishga tushiring." >&2
+if [ ! -f "$SO/lib/libsherpa-onnx-c-api.a" ]; then
+    echo "Xato: sherpa-onnx topilmadi ($SO). Avval tools/fetch-gigaam.sh ni ishga tushiring." >&2
     exit 1
 fi
 
@@ -41,45 +34,18 @@ COMMON_FW="-framework Foundation -framework Accelerate -framework AVFoundation \
     -framework AppKit -framework QuartzCore -framework CoreGraphics \
     -framework Carbon -framework ApplicationServices"
 
-echo "[1/4] Kompilyatsiya + linking (${ARCHS[*]})..."
-EXES=()
-for ARCH in "${ARCHS[@]}"; do
-    if [ "$ARCH" = "arm64" ]; then
-        LIB="$LIB_ARM"; TRIPLE="arm64-apple-macos13.0"
-        # arm64 — Metal backend'ni force_load + Metal freymvorklari
-        METAL="-Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-metal/libggml-metal.a \
-            -framework Metal -framework MetalKit"
-        # whisper.cpp собран с BLAS (Accelerate) — его бэкенд тоже надо прилинковать
-        [ -f "$LIB/ggml/src/ggml-blas/libggml-blas.a" ] && \
-            METAL="$METAL -Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-blas/libggml-blas.a"
-    else
-        # x86_64 — faqat CPU. Metal bu Mac'da (AMD Radeon Pro) CPU'dan ~24 barobar
-        # sekin chiqdi, shuning uchun ulanmaydi. BLAS (Accelerate) backend kerak.
-        LIB="$LIB_X64"; TRIPLE="x86_64-apple-macos13.0"
-        METAL="-Xlinker -force_load -Xlinker $LIB/ggml/src/ggml-blas/libggml-blas.a"
-    fi
-    echo "  -> $ARCH"
-    $NICE clang -c "$SRC/whisper_bridge.c" -arch "$ARCH" -O2 \
-        -I"$WC/include" -I"$WC/ggml/include" -o "$SRC/whisper_bridge.$ARCH.o"
-    $NICE swiftc -O -target "$TRIPLE" "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/supervisor.swift" "$SRC/whisper_bridge.$ARCH.o" \
-        -import-objc-header "$SRC/Bridging.h" \
-        "$LIB/src/libwhisper.a" \
-        "$LIB/ggml/src/libggml.a" \
-        "$LIB/ggml/src/libggml-base.a" \
-        -Xlinker -force_load -Xlinker "$LIB/ggml/src/libggml-cpu.a" \
-        $METAL $COMMON_FW -lc++ \
-        -o "$SRC/RubaiSTTDictation.$ARCH"
-    EXES+=("$SRC/RubaiSTTDictation.$ARCH")
-done
-
-# Universal binarga birlashtirish (yoki bitta arxitektura)
-if [ ${#EXES[@]} -gt 1 ]; then
-    lipo -create "${EXES[@]}" -output "$SRC/RubaiSTTDictation"
-    echo "  universal: $(lipo -archs "$SRC/RubaiSTTDictation")"
-else
-    cp "${EXES[0]}" "$SRC/RubaiSTTDictation"
-fi
-rm -f "$SRC"/whisper_bridge.*.o "$SRC"/RubaiSTTDictation.arm64 "$SRC"/RubaiSTTDictation.x86_64
+echo "[1/4] Kompilyatsiya + linking (arm64)..."
+L="$SO/lib"
+$NICE clang -c "$SRC/gigaam_bridge.c" -arch arm64 -O2 -I"$SO/include" -o "$SRC/gigaam_bridge.o"
+$NICE swiftc -O -target arm64-apple-macos13.0 "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/supervisor.swift" "$SRC/gigaam_bridge.o" \
+    -import-objc-header "$SRC/Bridging.h" \
+    "$L/libsherpa-onnx-c-api.a" "$L/libsherpa-onnx-core.a" "$L/libsherpa-onnx-fstfar.a" \
+    "$L/libsherpa-onnx-fst.a" "$L/libsherpa-onnx-kaldifst-core.a" "$L/libkaldi-native-fbank-core.a" \
+    "$L/libkaldi-decoder-core.a" "$L/libkissfft-float.a" "$L/libssentencepiece_core.a" \
+    "$L/libutf8proc.a" "$L/libonnxruntime.a" \
+    $COMMON_FW -framework CoreML -lc++ \
+    -o "$SRC/RubaiSTTDictation"
+rm -f "$SRC/gigaam_bridge.o"
 
 echo "[3/4] .app bundle..."
 rm -rf "$APP"

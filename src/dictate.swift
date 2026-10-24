@@ -20,10 +20,10 @@ final class Whisper {
     private var loaded = false
     private let q = DispatchQueue(label: "rubai.whisper")
 
-    // Файл модели. large-v3-turbo на Metal: заметно точнее small в русском.
-    // q5_0, а не q8_0: точность на замере одинаковая, а модель на 300 МБ меньше —
-    // меньше памяти и нагрева на MacBook Air без вентилятора.
-    static let modelFile = "ggml-large-v3-turbo-q5_0"
+    // Папка модели: GigaAM v3 (Сбер), CTC + пунктуация, int8 (225 МБ), через sherpa-onnx.
+    // Заменила large-v3-turbo 25.10.2026: легче, сама ставит знаки, и на тишине
+    // не выдумывает «Субтитры сделал…». Внутри model.int8.onnx + tokens.txt.
+    static let modelFile = "gigaam-v3-ctc-punct"
 
     // Сколько модель живёт в памяти после последней диктовки. Потом выгружается —
     // в простое приложение не держит ~1 ГБ и ничего не считает.
@@ -46,15 +46,15 @@ final class Whisper {
     // nusxada turadi. Shuning uchun barcha ma'lum joylarni ketma-ket tekshiramiz —
     // qaysi nusxa ishga tushsa ham diktovka ishlayveradi.
     private func modelPath() -> String? {
-        let f = Whisper.modelFile + ".bin"
+        let f = Whisper.modelFile
         var candidates: [String] = []
-        if let p = Bundle.main.path(forResource: Whisper.modelFile, ofType: "bin") { candidates.append(p) }
+        if let r = Bundle.main.resourcePath { candidates.append(r + "/" + f) }
         candidates += [
             "/Applications/RubaiSTT Dictation.app/Contents/Resources/" + f,
             NSHomeDirectory() + "/Applications/RubaiSTT Dictation.app/Contents/Resources/" + f,
             NSHomeDirectory() + "/rubai-stt/models/" + f,
         ]
-        for p in candidates where FileManager.default.fileExists(atPath: p) {
+        for p in candidates where FileManager.default.fileExists(atPath: p + "/model.int8.onnx") {
             if p != candidates.first { rlog("[rubai] model boshqa joydan olindi: \(p)") }
             return p
         }
@@ -676,10 +676,20 @@ final class StreamTranscriber {
         }
     }
 
+    // GigaAM начинает каждый кусок с заглавной, но кусок, отрезанный на паузе
+    // посреди мысли, кончается без знака: «…склад Второе…». Тогда ставим точку.
     private func joined() -> String {
-        parts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-             .filter { !$0.isEmpty }
-             .joined(separator: " ")
+        let p = parts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                     .filter { !$0.isEmpty }
+        var out = ""
+        for s in p {
+            if let last = out.last, !".!?…:;,—-".contains(last),
+               let first = s.first, first.isUppercase {
+                out += "."
+            }
+            out += out.isEmpty ? s : " " + s
+        }
+        return out
     }
 }
 

@@ -30,19 +30,18 @@ else
 fi
 
 echo "[2/6] Modellar tekshirilmoqda"
-# Имя должно совпадать с Whisper.modelFile в dictate.swift
-MODEL="ggml-large-v3-turbo-q5_0.bin"
-if [ ! -f "$APP/Contents/Resources/$MODEL" ] && [ -f "$HOME/rubai-stt/models/$MODEL" ]; then
-    cp "$HOME/rubai-stt/models/$MODEL" "$APP/Contents/Resources/$MODEL"
+# Имя должно совпадать с Whisper.modelFile в dictate.swift (это папка GigaAM)
+MODEL="gigaam-v3-ctc-punct"
+if [ ! -f "$APP/Contents/Resources/$MODEL/model.int8.onnx" ] && [ -f "$HOME/rubai-stt/models/$MODEL/model.int8.onnx" ]; then
+    rm -rf "$APP/Contents/Resources/$MODEL"
+    cp -R "$HOME/rubai-stt/models/$MODEL" "$APP/Contents/Resources/$MODEL"
 fi
-# Прочие модели (узбекская, small, прежняя turbo) не используются — освобождаем место
-for old in "$APP"/Contents/Resources/ggml-*.bin; do
-    [ "$(basename "$old")" = "$MODEL" ] || rm -f "$old"
-done
-if [ -f "$APP/Contents/Resources/$MODEL" ]; then
+# Старые модели Whisper больше не используются — освобождаем место
+rm -f "$APP"/Contents/Resources/ggml-*.bin
+if [ -f "$APP/Contents/Resources/$MODEL/model.int8.onnx" ]; then
     echo "  ✓ $MODEL"
 else
-    echo "  ✗ $MODEL TOPILMADI — diktovka ishlamaydi! (~/rubai-stt/models ga yuklab qo'ying)" >&2
+    echo "  ✗ $MODEL TOPILMADI — diktovka ishlamaydi! (tools/fetch-gigaam.sh)" >&2
 fi
 
 echo "[3/6] Imzolash"
