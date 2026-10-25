@@ -1,111 +1,63 @@
-# 🎙️ RubaiSTT Dictation — O'zbekcha ovozli yozuv (macOS)
+# 🎙️ RubaiSTT Dictation — офлайн-диктовка для macOS (русский + английский)
 
-Istalgan ilovada (Telegram, Messages, brauzer, hujjat — qayerda kursor bo'lsa) **⌃⌥D** bosib o'zbekcha gapiring — matn avtomatik o'sha joyga lotin alifbosida yoziladi.
+Меню-бар приложение: в любом окне говорите — текст вставляется туда, где курсор.
+Работает **без интернета**, на Apple Silicon (MacBook Air M5).
 
-macOS'ning o'rnatilgan diktovkasi kabi, lekin **o'zbek tili uchun maxsus**, **butunlay oflayn** (internetsiz), va **bepul**.
+> Технические детали, замеры и грабли — в [CLAUDE.md](CLAUDE.md). Читать перед любой правкой.
 
-> System-wide Uzbek speech-to-text dictation for macOS. Press **⌃⌥D** anywhere, speak Uzbek, and the transcribed text is typed into the focused field. Powered by the [rubaiSTT](https://huggingface.co/islomov/rubaistt_v2_medium) model running locally via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) with Metal acceleration. Fully offline.
+## Управление
 
----
+| Действие | Что делает |
+|---|---|
+| **⌘⌘** (двойной тап левой или правой) | начать запись |
+| **⌘** (один тап во время записи) | остановить, распознать, вставить |
+| **⎋** | отмена |
+| ⌃⌥D | запасной вариант |
 
-## ✨ Xususiyatlar / Features
+Текст всегда остаётся в буфере обмена. Если поля ввода нет — капсула пишет «Скопировано · ⌘V».
 
-- 🌐 **Tizim bo'ylab** — istalgan ilovada ishlaydi (global hotkey **⌃⌥D**)
-- 🇺🇿 **O'zbek tiliga maxsus** — `rubaiSTT v2 medium` modeli, lotin alifbosi
-- ⚡ **Metal tezlashtirish** — Apple Silicon GPU'da tez · Intel'da CPU bilan ishlaydi (universal)
-- 🔌 **To'liq oflayn** — hech qanday server/internet kerak emas, ovoz qurilmangizdan chiqmaydi
-- 🪶 **Yengil** — menyu-bar ilovasi; model 3 daqiqa ishlatilmasa RAM'dan bo'shaydi
-- ⌨️ **Sozlanadigan tugma** — diktovka tugmasini Sozlamalar oynasidan o'zgartirish mumkin (standart ⌃⌥D)
+## Как устроено (с 25.10.2026)
 
-## 📋 Talablar / Requirements
+- **Модель:** Parakeet TDT 0.6b v3 (NVIDIA, int8, 640 МБ) через [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx).
+  Понимает русский и английский, сама ставит знаки препинания, на тишине и шуме ничего не выдумывает.
+- **Скорость:** 6 с речи → ~0,4 с на CPU M5.
+- **Нагрузка в простое — почти ноль:** модель работает в отдельном процессе `rubai-asr`,
+  он запускается на ⌘⌘ и полностью закрывается через 2 минуты тишины.
+  В простое приложение — 19 МБ памяти и 0 % процессора; во время диктовки — ~1,1 ГБ.
+- **Английские термины** (Supabase, Railway, Vercel…) правит словарь `src/terms.swift`.
+- **Отказоустойчивость:** сторож перезапускает зависшее приложение, launchd поднимает упавшее.
 
-- macOS 13+ · **Universal** — Apple Silicon (M1–M5, Metal bilan tez) yoki Intel (CPU, sekinroq)
-- [Homebrew](https://brew.sh)
-- Xcode Command Line Tools (`xcode-select --install`)
-- ~1 GB disk (model ~820 MB, q8_0)
+## Файлы
 
-## 🚀 O'rnatish / Install
+| Файл | Что внутри |
+|---|---|
+| `src/dictate.swift` | всё приложение: запись, капсула, вставка, клавиши |
+| `src/audio.swift` | обрезка тишины, нарезка на куски |
+| `src/asr_client.c` | сторона приложения: запуск/остановка `rubai-asr`, обмен по трубам |
+| `src/asr_helper.c` | процесс `rubai-asr`: держит модель и распознаёт |
+| `src/gigaam_bridge.c` | вызовы sherpa-onnx (Parakeet или GigaAM — по файлам в папке модели) |
+| `src/terms.swift` | словарь английских терминов |
+| `src/supervisor.swift` | сторож самолечения |
+| `tools/` | симуляция нажатий, проверка микрофона, тесты |
 
-### A) Tayyor ilova (oson) — DMG
-
-1. **[⬇️ RubaiSTT-Dictation.dmg yuklab olish](https://github.com/MuhammadMirrr/uzbek-dictation/releases/download/v1.0/RubaiSTT-Dictation.dmg)** (~785 MB, model ichida)
-2. DMG'ni oching va ilovani **Applications** papkasiga torting
-3. Ilovani ishga tushiring — **Xush kelibsiz** oynasi ikkita ruxsatni (mikrofon + Accessibility) berishda yo'l-yo'riq ko'rsatadi
-
-Model ilova ichida — **to'liq oflayn**, terminal kerak emas.
-
-#### Birinchi ochish (muhim)
-
-Ilova **Developer ID bilan imzolangan**, lekin hozircha notarize qilinmagan. Shuning uchun **birinchi marta** macOS ogohlantirishi mumkin (*"Apple cannot check it for malicious software"*). Bir martalik yechim:
-
-- **macOS 13–14:** ilovaga **o'ng tugma (Control-click) → Open → Open**
-- **macOS 15 (Sequoia):** ilovani oching → bloklanadi → **System Settings → Privacy & Security** → pastga tushing → **«Open Anyway» / «Все равно открыть»** → tasdiqlang
-
-Bir marta shunday qilsangiz, keyin doim normal ochiladi.
-
-### B) Manbadan build (developer)
+## Сборка и установка
 
 ```bash
-git clone https://github.com/MuhammadMirrr/uzbek-dictation.git
-cd uzbek-dictation
-./setup.sh
+bash tools/fetch-gigaam.sh        # один раз: sherpa-onnx + модели в ~/rubai-stt/models
+bash src/build.sh && bash src/install.sh   # никогда не останавливаться на build.sh
 ```
 
-`setup.sh` avtomatik: kerakli vositalarni o'rnatadi → whisper.cpp'ni Metal bilan build qiladi → modelni yuklaydi → ilovani build qilib o'rnatadi → login'da avto-ishga tushishni sozlaydi.
+`install.sh` кладёт приложение в `/Applications`, копирует модель, подписывает сертификатом
+«RubaiSTT Local Signing» (иначе слетает разрешение Accessibility) и перезапускает.
 
-### Oxirgi qadam — Accessibility ruxsati
+## Откат на GigaAM (Сбер, только русский)
 
-Matn avtomatik joylashishi uchun (⌘V yuborish) bir marta ruxsat bering:
+Папка `~/rubai-stt/models/gigaam-v3-ctc-punct` оставлена. Вернуть `Whisper.modelFile` в
+`src/dictate.swift` и `MODEL` в `src/install.sh` на `gigaam-v3-ctc-punct`, проверку файла в
+install.sh — на `model.int8.onnx`, затем собрать и установить.
 
-1. **System Settings → Privacy & Security → Accessibility**
-2. **"RubaiSTT Dictation"** ni qo'shing (`+`) va **yoqing** ✅
-
-Birinchi yozishda **mikrofon** ruxsati ham so'raladi — ruxsat bering.
-
-## 🎯 Ishlatish / Usage
-
-1. Istalgan joyda kursorni yozish maydoniga qo'ying
-2. **⌃⌥D** bosing → 🔴 gapiring → **⌃⌥D** yana bosing
-3. Matn o'sha joyga yoziladi
-
-Menyu-bardagi 🎙️ ikonadan ham boshqarish mumkin.
-
-## 📦 Tarqatish / Release (developer)
-
-Imzolangan + notarize qilingan DMG yasash:
+## Логи
 
 ```bash
-# Bir martalik: notarize uchun keychain profil
-xcrun notarytool store-credentials rubai-notary \
-    --apple-id "siz@example.com" --team-id "TEAMID" \
-    --password "xxxx-xxxx-xxxx-xxxx"   # app-specific parol
-
-brew install create-dmg     # chiroyli DMG foni uchun (ixtiyoriy)
-./scripts/release.sh        # build → Developer ID imzo → notarize → DMG
+/usr/bin/log show --last 10m --predicate 'subsystem == "com.rubaistt.dictation"' --style compact
 ```
-
-Natija: `dist/RubaiSTT-Dictation.dmg`. Skript "Developer ID Application" sertifikatini avtomatik topadi; model `.app` ichiga joylanadi.
-
-## ⚠️ Eslatma / Notes
-
-- Tayyor DMG **Developer ID bilan imzolangan** (hardened runtime). Notarize keyinroq qo'shiladi — shu sababli birinchi ochishda yuqoridagi bir martalik qadam kerak. Manbadan build (`setup.sh`) esa **ad-hoc imzolangan** (lokal, Gatekeeper bloklamaydi).
-- App Store'ga **chiqmaydi** — tizim bo'ylab matn yozish (synthetic ⌘V) sandbox'da taqiqlangan; shuning uchun Developer ID orqali tarqatiladi.
-- **Universal binary** — Apple Silicon (Metal GPU) va Intel (CPU). Intel'da sezilarli sekinroq, lekin ishlaydi.
-
-## 🛠 Texnik tafsilotlar
-
-- **Model:** [`islomov/rubaistt_v2_medium`](https://huggingface.co/islomov/rubaistt_v2_medium) → ggml **q8_0** (8-bit) ga siqilgan — ~820 MB, ~700 MB kamroq RAM, aniqlik deyarli o'zgarmaydi
-- **Inference:** whisper.cpp + Metal, beam search (maksimal aniqlik)
-- **Til:** `uz`, lotin alifbosi
-- **UI:** Swift / AppKit, menyu-bar (LSUIElement), global hotkey Carbon orqali
-- **Matn kiritish:** clipboard + ⌘V (CGEvent) — Accessibility ruxsati kerak
-
-## 📄 Litsenziya
-
-MIT (`LICENSE`). Model va whisper.cpp o'z litsenziyalari ostida.
-
-## 🙏 Minnatdorchilik
-
-- [rubaiSTT](https://huggingface.co/islomov/rubaistt_v2_medium) — Sardor Islomov (o'zbek STT modeli)
-- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) — Georgi Gerganov
-- [OpenAI Whisper](https://github.com/openai/whisper)
