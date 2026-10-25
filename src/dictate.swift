@@ -22,8 +22,10 @@ final class Whisper {
 
     // Папка модели: GigaAM v3 (Сбер), CTC + пунктуация, int8 (225 МБ), через sherpa-onnx.
     // Заменила large-v3-turbo 25.10.2026: легче, сама ставит знаки, и на тишине
-    // не выдумывает «Субтитры сделал…». Внутри model.int8.onnx + tokens.txt.
-    static let modelFile = "gigaam-v3-ctc-punct"
+    // не выдумывает «Субтитры сделал…».
+    // 25.10.2026 вечер: GigaAM не понимал английский -> Parakeet TDT v3 (NVIDIA, ru+en,
+    // encoder/decoder/joiner.int8.onnx + tokens.txt). Мост сам различает модели по файлам.
+    static let modelFile = "parakeet-v3"
 
     // Сколько модель живёт в памяти после последней диктовки. Потом выгружается —
     // в простое приложение не держит ~1 ГБ и ничего не считает.
@@ -54,7 +56,7 @@ final class Whisper {
             NSHomeDirectory() + "/Applications/RubaiSTT Dictation.app/Contents/Resources/" + f,
             NSHomeDirectory() + "/rubai-stt/models/" + f,
         ]
-        for p in candidates where FileManager.default.fileExists(atPath: p + "/model.int8.onnx") {
+        for p in candidates where FileManager.default.fileExists(atPath: p + "/tokens.txt") {
             if p != candidates.first { rlog("[rubai] model boshqa joydan olindi: \(p)") }
             return p
         }

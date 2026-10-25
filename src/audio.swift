@@ -92,8 +92,11 @@ enum Audio {
 
     // Yozuv oldidan whisper'ga beriladigan tayyorgarlik — bo'lak uchun ham,
     // butun yozuv uchun ham bir xil.
+    // 25.10.2026: compressPauses больше не зовём — Parakeet и так быстрый, а сжатые
+    // до 0,2 с паузы ломают ему переход русский -> английский («Тен чек до лодс форс»).
     static func prepare(_ s: [Float]) -> [Float] {
-        padIfShort(compressPauses(trimSilence(s)))
+        // + 0,6 с тишины в конце: без неё Parakeet иногда теряет последнюю фразу.
+        padIfShort(trimSilence(s)) + [Float](repeating: 0, count: Int(0.6 * Double(rate)))
     }
 
     // MARK: Bo'lakka kesish nuqtasi

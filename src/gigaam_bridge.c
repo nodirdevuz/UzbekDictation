@@ -8,6 +8,13 @@
 // Замер на M5 (4 потока CPU): 11,3 с речи -> ~1,0 с, память ~370 МБ.
 // CoreML-провайдер onnxruntime проверен — быстрее не стало, поэтому CPU.
 //
+// 25.10.2026 (вечер): владелец — GigaAM не понимает английский. Основная модель теперь
+// Parakeet TDT 0.6b v3 (NVIDIA, int8, 25 языков, русский + английский, сама ставит знаки).
+// Тест M5: английская фраза — без ошибок (GigaAM: «AftheIntocation Midlewer»),
+// Railway — латиницей; 6,3 с речи -> 0,43 с. Память ~1,1 ГБ, но только пока модель
+// загружена (выгружается через 2 мин простоя). Мост понимает обе модели:
+// в папке есть encoder.int8.onnx -> Parakeet (transducer), иначе GigaAM (CTC).
+//
 // accurate / full_ctx / prompt — параметры Whisper, тут не нужны и игнорируются.
 #include <stdlib.h>
 #include <string.h>
@@ -25,15 +32,29 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 int rubai_load(const char *model_dir) {
     pthread_mutex_lock(&mu);
     if (rec) { pthread_mutex_unlock(&mu); return 0; }
-    char model[2048], tokens[2048];
+    char model[2048], tokens[2048], enc[2048], dec[2048], joi[2048];
     snprintf(model, sizeof model, "%s/model.int8.onnx", model_dir);
     snprintf(tokens, sizeof tokens, "%s/tokens.txt", model_dir);
+    snprintf(enc, sizeof enc, "%s/encoder.int8.onnx", model_dir);
+    snprintf(dec, sizeof dec, "%s/decoder.int8.onnx", model_dir);
+    snprintf(joi, sizeof joi, "%s/joiner.int8.onnx", model_dir);
+    FILE *probe = fopen(enc, "rb");
+    int parakeet = probe != NULL;
+    if (probe) fclose(probe);
 
     SherpaOnnxOfflineRecognizerConfig c;
     memset(&c, 0, sizeof c);
     c.feat_config.sample_rate = 16000;
-    c.feat_config.feature_dim = 64;
-    c.model_config.nemo_ctc.model = model;
+    if (parakeet) {
+        c.feat_config.feature_dim = 80;
+        c.model_config.transducer.encoder = enc;
+        c.model_config.transducer.decoder = dec;
+        c.model_config.transducer.joiner = joi;
+        c.model_config.model_type = "nemo_transducer";
+    } else {
+        c.feat_config.feature_dim = 64;
+        c.model_config.nemo_ctc.model = model;
+    }
     c.model_config.tokens = tokens;
     c.model_config.num_threads = GIGA_THREADS;
     c.model_config.provider = "cpu";

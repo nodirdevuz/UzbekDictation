@@ -29,4 +29,14 @@ if [ ! -f "$MODEL_DIR/model.int8.onnx" ]; then
     mkdir -p "$MODEL_DIR"
     cp "$TMP/$MODEL_NAME/model.int8.onnx" "$TMP/$MODEL_NAME/tokens.txt" "$TMP/$MODEL_NAME/LICENSE" "$MODEL_DIR/"
 fi
-echo "Готово: $ROOT/sherpa-onnx, $MODEL_DIR"
+# Основная модель с 25.10.2026 — Parakeet TDT v3 (NVIDIA, русский + английский).
+P_NAME=sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
+P_DIR="$HOME/rubai-stt/models/parakeet-v3"
+if [ ! -f "$P_DIR/encoder.int8.onnx" ]; then
+    echo "Parakeet v3..."
+    curl -fsSL -o "$TMP/p.tar.bz2" "$REL/asr-models/$P_NAME.tar.bz2"
+    tar xjf "$TMP/p.tar.bz2" -C "$TMP"
+    mkdir -p "$P_DIR"
+    cp "$TMP/$P_NAME"/{encoder,decoder,joiner}.int8.onnx "$TMP/$P_NAME/tokens.txt" "$P_DIR/"
+fi
+echo "Готово: $ROOT/sherpa-onnx, $MODEL_DIR, $P_DIR"

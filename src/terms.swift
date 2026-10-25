@@ -14,7 +14,7 @@ enum Terms {
         let list: [(String, String)] = [
             ("supaba(?:e|es|se|ze|is|ise|ez)|supabeis|supabays|supabase"
              + "|суп[ыаиу]?[- ]?(?:б[аэе][йи]?[сз]\(w)|abae?s?e?|abase|abeis)"
-             + "|супаб[аэе][йи]?[сз]\(w)|супабаес\(w)", "Supabase"),
+             + "|супаб[аэе][йи]?[сз]\(w)|супабаес\(w)|супа ?без\(w)", "Supabase"),
             ("р[еэ][йи]лв[еэ][йи]\(w)|railwey|reilway", "Railway"),
             ("в[еёоа]рс[еиэ]л\(w)|в[еа]рц[еэ]л\(w)|versel|vercell", "Vercel"),
             ("в[еэ]б[- ]?(?:эп|эпп|апп?|ап)\(w)|web[- ]?app|webapp", "Web App"),

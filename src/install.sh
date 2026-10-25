@@ -30,15 +30,15 @@ else
 fi
 
 echo "[2/6] Modellar tekshirilmoqda"
-# Имя должно совпадать с Whisper.modelFile в dictate.swift (это папка GigaAM)
-MODEL="gigaam-v3-ctc-punct"
-if [ ! -f "$APP/Contents/Resources/$MODEL/model.int8.onnx" ] && [ -f "$HOME/rubai-stt/models/$MODEL/model.int8.onnx" ]; then
+# Имя должно совпадать с Whisper.modelFile в dictate.swift (папка Parakeet v3)
+MODEL="parakeet-v3"
+if [ ! -f "$APP/Contents/Resources/$MODEL/encoder.int8.onnx" ] && [ -f "$HOME/rubai-stt/models/$MODEL/encoder.int8.onnx" ]; then
     rm -rf "$APP/Contents/Resources/$MODEL"
     cp -R "$HOME/rubai-stt/models/$MODEL" "$APP/Contents/Resources/$MODEL"
 fi
 # Старые модели Whisper больше не используются — освобождаем место
 rm -f "$APP"/Contents/Resources/ggml-*.bin
-if [ -f "$APP/Contents/Resources/$MODEL/model.int8.onnx" ]; then
+if [ -f "$APP/Contents/Resources/$MODEL/encoder.int8.onnx" ]; then
     echo "  ✓ $MODEL"
 else
     echo "  ✗ $MODEL TOPILMADI — diktovka ishlamaydi! (tools/fetch-gigaam.sh)" >&2
