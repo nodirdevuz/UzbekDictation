@@ -36,21 +36,26 @@ COMMON_FW="-framework Foundation -framework Accelerate -framework AVFoundation \
 
 echo "[1/4] Kompilyatsiya + linking (arm64)..."
 L="$SO/lib"
-$NICE clang -c "$SRC/gigaam_bridge.c" -arch arm64 -O2 -I"$SO/include" -o "$SRC/gigaam_bridge.o"
-$NICE swiftc -O -target arm64-apple-macos13.0 "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/supervisor.swift" "$SRC/gigaam_bridge.o" \
-    -import-objc-header "$SRC/Bridging.h" \
+# Модель живёт в отдельном процессе rubai-asr (asr_helper.c): его закрывают в простое,
+# и вся память sherpa-onnx уходит. Приложение с ним говорит через asr_client.c.
+$NICE clang -O2 -arch arm64 -mmacosx-version-min=13.0 "$SRC/asr_helper.c" -I"$SO/include" -I"$SRC" \
     "$L/libsherpa-onnx-c-api.a" "$L/libsherpa-onnx-core.a" "$L/libsherpa-onnx-fstfar.a" \
     "$L/libsherpa-onnx-fst.a" "$L/libsherpa-onnx-kaldifst-core.a" "$L/libkaldi-native-fbank-core.a" \
     "$L/libkaldi-decoder-core.a" "$L/libkissfft-float.a" "$L/libssentencepiece_core.a" \
     "$L/libutf8proc.a" "$L/libonnxruntime.a" \
-    $COMMON_FW -framework CoreML -lc++ \
+    -framework Foundation -framework CoreML -lc++ -o "$SRC/rubai-asr"
+$NICE clang -c "$SRC/asr_client.c" -arch arm64 -O2 -mmacosx-version-min=13.0 -o "$SRC/asr_client.o"
+$NICE swiftc -O -target arm64-apple-macos13.0 "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/supervisor.swift" "$SRC/asr_client.o" \
+    -import-objc-header "$SRC/Bridging.h" \
+    $COMMON_FW \
     -o "$SRC/RubaiSTTDictation"
-rm -f "$SRC/gigaam_bridge.o"
+rm -f "$SRC/asr_client.o"
 
 echo "[3/4] .app bundle..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$SRC/RubaiSTTDictation" "$APP/Contents/MacOS/RubaiSTTDictation"
+cp "$SRC/rubai-asr" "$APP/Contents/MacOS/rubai-asr"
 cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'

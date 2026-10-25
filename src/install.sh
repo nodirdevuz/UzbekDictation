@@ -26,6 +26,7 @@ else
     pkill -f RubaiSTTDictation 2>/dev/null || true
     sleep 1
     cp "$BUILT/Contents/MacOS/RubaiSTTDictation" "$APP/Contents/MacOS/RubaiSTTDictation"
+    cp "$BUILT/Contents/MacOS/rubai-asr" "$APP/Contents/MacOS/rubai-asr"
     cp "$BUILT/Contents/Info.plist" "$APP/Contents/Info.plist"
 fi
 
