@@ -1,7 +1,20 @@
 # 🎙️ RubaiSTT Dictation — офлайн-диктовка для macOS (русский + английский)
 
 Меню-бар приложение: в любом окне говорите — текст вставляется туда, где курсор.
-Работает **без интернета**, на Apple Silicon (MacBook Air M5).
+Работает **без интернета**, на любом Mac с macOS 13+: Apple Silicon (M1–M5) и Intel.
+
+## Установка одной командой
+
+```bash
+git clone https://github.com/nodirdevuz/UzbekDictation ~/UzbekDictation && bash ~/UzbekDictation/setup.sh
+```
+
+Скрипт сам определит процессор (arm64 / Intel x86_64), скачает движок sherpa-onnx под него и модель
+Parakeet v3 (~640 МБ), создаст сертификат подписи, соберёт и установит приложение в `/Applications`,
+включит автозапуск. Нужны только Xcode Command Line Tools (скрипт сам предложит поставить).
+В конце включить «RubaiSTT Dictation» в «Конфиденциальность → Универсальный доступ» и разрешить микрофон.
+
+На Intel распознавание медленнее (ожидаемо ~1–2 с на 6 с речи против 0,4 с на M5), остальное так же.
 
 > Технические детали, замеры и грабли — в [CLAUDE.md](CLAUDE.md). Читать перед любой правкой.
 
@@ -43,7 +56,8 @@
 ## Сборка и установка
 
 ```bash
-bash tools/fetch-gigaam.sh        # один раз: sherpa-onnx + модели в ~/rubai-stt/models
+bash tools/fetch-gigaam.sh        # один раз: sherpa-onnx (под этот процессор) + модель в ~/rubai-stt/models
+bash tools/make-signing-cert.sh   # один раз на новом Mac: сертификат подписи
 bash src/build.sh && bash src/install.sh   # никогда не останавливаться на build.sh
 ```
 

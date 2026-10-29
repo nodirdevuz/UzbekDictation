@@ -8,7 +8,17 @@
 **Актуально — первый раздел (Parakeet + процесс `rubai-asr`) и «Отказоустойчивость».** Всё, что
 ниже говорит о whisper.cpp, узбекском, Intel, `ggml-*.bin`, — история: грабли полезны, но
 конкретные модели и параметры уже не действуют. Краткая сводка для человека — `README.md`.
-Репозиторий: github.com/nodirdevuz/UzbekDictation (private), ветка `main`.
+Репозиторий: github.com/nodirdevuz/UzbekDictation (public с 29.10.2026), ветка `main`.
+
+## 29.10.2026 — Intel снова поддерживается, установка одной командой
+- `setup.sh` (переписан под Parakeet): CLT → `tools/fetch-gigaam.sh` → `tools/make-signing-cert.sh` → build → install.
+- Архитектура берётся из `uname -m` (или `ARCH=x64|x86_64|arm64`): fetch качает `osx-x64`/`osx-arm64`
+  static-no-tts libs и пишет `sherpa-onnx/.arch` (чужая архитектура → перекачать), build собирает `-arch $ARCH`.
+- Проверено на M5 кросс-сборкой: `ARCH=x64 bash tools/fetch-gigaam.sh && ARCH=x86_64 bash src/build.sh` →
+  оба бинарника Mach-O x86_64, линковка чистая. Запуск на живом Intel НЕ проверен (Rosetta на M5 нет).
+- GigaAM по умолчанию больше не качается (`WITH_GIGAAM=1` — скачать).
+- `make-signing-cert.sh`: сертификат с keyUsage digitalSignature, .p12 с 3DES/sha1; доверие системы не ставит —
+  на macOS 27 codesign подписывает и без него (проверено во временной связке ключей).
 
 ## 🟢 25.10.2026 (вечер) — движок: Parakeet TDT 0.6b v3 (NVIDIA), русский + английский
 

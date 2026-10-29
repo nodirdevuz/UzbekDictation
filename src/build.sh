@@ -4,8 +4,12 @@ set -e
 SRC="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SRC/.." && pwd)"
 # Движок распознавания — sherpa-onnx + GigaAM v3 (с 25.10.2026, вместо whisper.cpp).
-# Библиотеки скачивает tools/fetch-gigaam.sh. Только arm64 (Apple Silicon).
+# Библиотеки скачивает tools/fetch-gigaam.sh — под процессор этого Mac (arm64 или Intel x86_64).
 SO="$ROOT/sherpa-onnx"
+if [ -z "$ARCH" ]; then
+    case "$(uname -m)" in arm64) ARCH=arm64 ;; *) ARCH=x86_64 ;; esac
+fi
+[ "$ARCH" = "x64" ] && ARCH=x86_64
 APP="$HOME/Applications/RubaiSTT Dictation.app"
 if [ ! -f "$SO/lib/libsherpa-onnx-c-api.a" ]; then
     echo "Xato: sherpa-onnx topilmadi ($SO). Avval tools/fetch-gigaam.sh ni ishga tushiring." >&2
@@ -34,18 +38,18 @@ COMMON_FW="-framework Foundation -framework Accelerate -framework AVFoundation \
     -framework AppKit -framework QuartzCore -framework CoreGraphics \
     -framework Carbon -framework ApplicationServices"
 
-echo "[1/4] Kompilyatsiya + linking (arm64)..."
+echo "[1/4] Kompilyatsiya + linking ($ARCH)..."
 L="$SO/lib"
 # Модель живёт в отдельном процессе rubai-asr (asr_helper.c): его закрывают в простое,
 # и вся память sherpa-onnx уходит. Приложение с ним говорит через asr_client.c.
-$NICE clang -O2 -arch arm64 -mmacosx-version-min=13.0 "$SRC/asr_helper.c" -I"$SO/include" -I"$SRC" \
+$NICE clang -O2 -arch $ARCH -mmacosx-version-min=13.0 "$SRC/asr_helper.c" -I"$SO/include" -I"$SRC" \
     "$L/libsherpa-onnx-c-api.a" "$L/libsherpa-onnx-core.a" "$L/libsherpa-onnx-fstfar.a" \
     "$L/libsherpa-onnx-fst.a" "$L/libsherpa-onnx-kaldifst-core.a" "$L/libkaldi-native-fbank-core.a" \
     "$L/libkaldi-decoder-core.a" "$L/libkissfft-float.a" "$L/libssentencepiece_core.a" \
     "$L/libutf8proc.a" "$L/libonnxruntime.a" \
     -framework Foundation -framework CoreML -lc++ -o "$SRC/rubai-asr"
-$NICE clang -c "$SRC/asr_client.c" -arch arm64 -O2 -mmacosx-version-min=13.0 -o "$SRC/asr_client.o"
-$NICE swiftc -O -target arm64-apple-macos13.0 "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/supervisor.swift" "$SRC/asr_client.o" \
+$NICE clang -c "$SRC/asr_client.c" -arch $ARCH -O2 -mmacosx-version-min=13.0 -o "$SRC/asr_client.o"
+$NICE swiftc -O -target $ARCH-apple-macos13.0 "$SRC/dictate.swift" "$SRC/audio.swift" "$SRC/terms.swift" "$SRC/supervisor.swift" "$SRC/asr_client.o" \
     -import-objc-header "$SRC/Bridging.h" \
     $COMMON_FW \
     -o "$SRC/RubaiSTTDictation"
